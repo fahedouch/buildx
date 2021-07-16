@@ -9,7 +9,9 @@ import (
 	"github.com/docker/buildx/bake"
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -25,12 +27,28 @@ type bakeOptions struct {
 func runBake(dockerCli command.Cli, targets []string, in bakeOptions) (err error) {
 	ctx := appcontext.Context()
 
+	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		end(err)
+	}()
+
 	var url string
+	cmdContext := "cwd://"
 
 	if len(targets) > 0 {
 		if bake.IsRemoteURL(targets[0]) {
 			url = targets[0]
 			targets = targets[1:]
+			if len(targets) > 0 {
+				if bake.IsRemoteURL(targets[0]) {
+					cmdContext = targets[0]
+					targets = targets[1:]
+
+				}
+			}
 		}
 	}
 
@@ -75,6 +93,7 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) (err error
 
 	var files []bake.File
 	var inp *bake.Input
+
 	if url != "" {
 		files, inp, err = bake.ReadRemoteFiles(ctx, dis, url, in.files, printer)
 	} else {
@@ -84,13 +103,21 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) (err error
 		return err
 	}
 
-	m, err := bake.ReadTargets(ctx, files, targets, overrides)
+	m, err := bake.ReadTargets(ctx, files, targets, overrides, map[string]string{
+		"BAKE_CMD_CONTEXT": cmdContext,
+	})
+	if err != nil {
+		return err
+	}
+
+	// this function can update target context string from the input so call before printOnly check
+	bo, err := bake.TargetsToBuildOpt(m, inp)
 	if err != nil {
 		return err
 	}
 
 	if in.printOnly {
-		dt, err := json.MarshalIndent(map[string]map[string]*bake.Target{"target": m}, "", "   ")
+		dt, err := json.MarshalIndent(map[string]map[string]*bake.Target{"target": m}, "", "  ")
 		if err != nil {
 			return err
 		}
@@ -103,12 +130,25 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) (err error
 		return nil
 	}
 
-	bo, err := bake.TargetsToBuildOpt(m, inp)
+	resp, err := build.Build(ctx, dis, bo, dockerAPI(dockerCli), dockerCli.ConfigFile(), printer)
 	if err != nil {
 		return err
 	}
 
-	_, err = build.Build(ctx, dis, bo, dockerAPI(dockerCli), dockerCli.ConfigFile(), printer)
+	if len(in.metadataFile) > 0 && resp != nil {
+		mdata := map[string]map[string]string{}
+		for k, r := range resp {
+			mdata[k] = r.ExporterResponse
+		}
+		mdatab, err := json.MarshalIndent(mdata, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := ioutils.AtomicWriteFile(in.metadataFile, mdatab, 0644); err != nil {
+			return err
+		}
+	}
+
 	return err
 }
 

@@ -18,6 +18,7 @@ Build from a file
 | `--builder string` | Override the configured builder instance |
 | [`-f`](#file), [`--file stringArray`](#file) | Build definition file |
 | `--load` | Shorthand for --set=*.output=type=docker |
+| `--metadata-file string` | Write build result metadata to the file |
 | [`--no-cache`](#no-cache) | Do not use cache when building the image |
 | [`--print`](#print) | Print the options without building |
 | [`--progress string`](#progress) | Set type of progress output (auto, plain, tty). Use plain to show container output |
@@ -32,6 +33,10 @@ Build from a file
 
 Bake is a high-level build command. Each specified target will run in parallel
 as part of the build.
+
+Read [High-level build options](https://github.com/docker/buildx#high-level-build-options) for introduction.
+
+Please note that `buildx bake` command may receive backwards incompatible features in the future if needed. We are looking for feedback on improving the command and extending the functionality further.
 
 ## Examples
 
@@ -260,8 +265,8 @@ $ TAG=$(git rev-parse --short HEAD) docker buildx bake --print webapp
 
 
 A [set of generally useful functions](https://github.com/docker/buildx/blob/master/bake/hcl.go#L19-L65)
-provided by [go-cty](https://github.com/zclconf/go-cty/tree/master/cty/function/stdlib)
-are available for use in HCL files. In addition, [user defined functions](https://github.com/hashicorp/hcl/tree/hcl2/ext/userfunc)
+provided by [go-cty](https://github.com/zclconf/go-cty/tree/main/cty/function/stdlib)
+are available for use in HCL files. In addition, [user defined functions](https://github.com/hashicorp/hcl/tree/main/ext/userfunc)
 are also supported.
 
 Example of using the `add` function:

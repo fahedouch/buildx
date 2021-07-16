@@ -25,10 +25,10 @@ Create a new image based on source images
 Imagetools contains commands for working with manifest lists in the registry.
 These commands are useful for inspecting multi-platform build results.
 
-Create creates a new manifest list based on source manifests. The source
-manifests can be manifest lists or single platform distribution manifests and
-must already exist in the registry where the new manifest is created. If only
-one source is specified create performs a carbon copy.
+Create a new manifest list based on source manifests. The source manifests can
+be manifest lists or single platform distribution manifests and must already
+exist in the registry where the new manifest is created. If only one source is
+specified, create performs a carbon copy.
 
 ## Examples
 
@@ -49,6 +49,19 @@ Use the `--dry-run` flag to not push the image, just show it.
 
 Reads source from files. A source can be a manifest digest, manifest reference,
 or a JSON of OCI descriptor object.
+
+In order to define annotations or additional platform properties like `os.version` and
+`os.features` you need to add them in the OCI descriptor object encoded in JSON.
+
+```
+docker buildx imagetools inspect --raw alpine | jq '.manifests[0] | .platform."os.version"="10.1"' > descr.json
+docker buildx imagetools create -f descr.json myuser/image
+```
+
+The descriptor in the file is merged with existing descriptor in the registry if it exists.
+
+The supported fields for the descriptor are defined in [OCI spec](https://github.com/opencontainers/image-spec/blob/master/descriptor.md#properties) .
+
 
 ### <a name="tag"></a> Set reference for new image  (-t, --tag)
 

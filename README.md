@@ -14,43 +14,45 @@ Key features:
 - Multiple builder instance support
 - Multi-node builds for cross-platform images
 - Compose build support
-- WIP: High-level build constructs (`bake`)
+- High-level build constructs (`bake`)
 - In-container driver support (both Docker and Kubernetes)
 
 # Table of Contents
 
 - [Installing](#installing)
+  - [Docker](#docker)
+  - [Binary release](#binary-release)
+  - [From `Dockerfile`](#from-dockerfile)
 - [Building](#building)
-    + [with Docker 18.09+](#with-docker-1809)
-    + [with buildx or Docker 19.03](#with-buildx-or-docker-1903)
+  - [with Docker 18.09+](#with-docker-1809)
+  - [with buildx or Docker 19.03](#with-buildx-or-docker-1903)
 - [Getting started](#getting-started)
-  * [Building with buildx](#building-with-buildx)
-  * [Working with builder instances](#working-with-builder-instances)
-  * [Building multi-platform images](#building-multi-platform-images)
-  * [High-level build options](#high-level-build-options)
-- [Documentation](#documentation)
-    + [`buildx build [OPTIONS] PATH | URL | -`](docs/reference/buildx_build.md)
-    + [`buildx create [OPTIONS] [CONTEXT|ENDPOINT]`](docs/reference/buildx_create.md)
-    + [`buildx use NAME`](docs/reference/buildx_use.md)
-    + [`buildx inspect [NAME]`](docs/reference/buildx_inspect.md)
-    + [`buildx ls`](docs/reference/buildx_ls.md)
-    + [`buildx stop [NAME]`](docs/reference/buildx_stop.md)
-    + [`buildx rm [NAME]`](docs/reference/buildx_rm.md)
-    + [`buildx bake [OPTIONS] [TARGET...]`](docs/reference/buildx_bake.md)
-    + [`buildx imagetools create [OPTIONS] [SOURCE] [SOURCE...]`](docs/reference/buildx_imagetools_create.md)
-    + [`buildx imagetools inspect NAME`](docs/reference/buildx_imagetools_inspect.md)
+  - [Building with buildx](#building-with-buildx)
+  - [Working with builder instances](#working-with-builder-instances)
+  - [Building multi-platform images](#building-multi-platform-images)
+  - [High-level build options](#high-level-build-options)
+- [Documentation](docs/reference)
+  - [`buildx build [OPTIONS] PATH | URL | -`](docs/reference/buildx_build.md)
+  - [`buildx create [OPTIONS] [CONTEXT|ENDPOINT]`](docs/reference/buildx_create.md)
+  - [`buildx use NAME`](docs/reference/buildx_use.md)
+  - [`buildx inspect [NAME]`](docs/reference/buildx_inspect.md)
+  - [`buildx ls`](docs/reference/buildx_ls.md)
+  - [`buildx stop [NAME]`](docs/reference/buildx_stop.md)
+  - [`buildx rm [NAME]`](docs/reference/buildx_rm.md)
+  - [`buildx bake [OPTIONS] [TARGET...]`](docs/reference/buildx_bake.md)
+  - [`buildx imagetools create [OPTIONS] [SOURCE] [SOURCE...]`](docs/reference/buildx_imagetools_create.md)
+  - [`buildx imagetools inspect NAME`](docs/reference/buildx_imagetools_inspect.md)
 - [Setting buildx as default builder in Docker 19.03+](#setting-buildx-as-default-builder-in-docker-1903)
 - [Contributing](#contributing)
 
 
 # Installing
 
-Using `buildx` as a docker CLI plugin requires using Docker 19.03. A limited set of functionality works with older versions of Docker when invoking the binary directly.
+Using `buildx` as a docker CLI plugin requires using Docker 19.03 or newer. A limited set of functionality works with older versions of Docker when invoking the binary directly.
 
-### Docker CE
+### Docker
 
-`buildx` comes bundled with Docker CE starting with 19.03, but requires experimental mode to be enabled on the Docker CLI.
-To enable it, `"experimental": "enabled"` can be added to the CLI configuration file `~/.docker/config.json`. An alternative is to set the `DOCKER_CLI_EXPERIMENTAL=enabled` environment variable.
+`buildx` comes bundled with Docker Desktop and in latest Docker CE packages, but may not be included in all Linux distros (in which case follow the binary release instructions).
 
 ### Binary release
 
@@ -61,20 +63,32 @@ Change the permission to execute:
 chmod a+x ~/.docker/cli-plugins/docker-buildx
 ```
 
+### From `Dockerfile`
+
+Here is how to use buildx inside a Dockerfile through the [`docker/buildx-bin`](https://hub.docker.com/r/docker/buildx-bin) image:
+
+```Dockerfile
+FROM docker
+COPY --from=docker/buildx-bin:latest /buildx /usr/libexec/docker/cli-plugins/docker-buildx
+RUN docker buildx version
+```
+
+
 # Building
 
-### with Docker 18.09+
-```
-$ git clone git://github.com/docker/buildx && cd buildx
-$ make install
-```
 
-### with buildx or Docker 19.03
+### with buildx or Docker 19.03+
 ```
 $ export DOCKER_BUILDKIT=1
 $ docker build --platform=local -o . git://github.com/docker/buildx
 $ mkdir -p ~/.docker/cli-plugins
 $ mv buildx ~/.docker/cli-plugins/docker-buildx
+```
+
+### with Docker 18.09+
+```
+$ git clone git://github.com/docker/buildx && cd buildx
+$ make install
 ```
 
 # Getting started
@@ -96,7 +110,7 @@ Buildx will always build using the BuildKit engine and does not require `DOCKER_
 
 Buildx build command supports the features available for `docker build` including the new features in Docker 19.03 such as outputs configuration, inline build caching or specifying target platform. In addition, buildx supports new features not yet available for regular `docker build` like building manifest lists, distributed caching, exporting build results to OCI image tarballs etc.
 
-Buildx is supposed to be flexible and can be run in different configurations that are exposed through a driver concept. Currently, we support a "docker" driver that uses the BuildKit library bundled into the docker daemon binary, and a "docker-container" driver that automatically launches BuildKit inside a Docker container. We plan to add more drivers in the future, for example, one that would allow running buildx inside an (unprivileged) container.
+Buildx is supposed to be flexible and can be run in different configurations that are exposed through a driver concept. Currently, we support a "docker" driver that uses the BuildKit library bundled into the Docker daemon binary, and a "docker-container" driver that automatically launches BuildKit inside a Docker container. We plan to add more drivers in the future, for example, one that would allow running buildx inside an (unprivileged) container.
 
 The user experience of using buildx is very similar across drivers, but there are some features that are not currently supported by the "docker" driver, because the BuildKit library bundled into docker daemon currently uses a different storage component. In contrast, all images built with "docker" driver are automatically added to the "docker images" view by default, whereas when using other drivers the method for outputting an image needs to be selected with `--output`.
 
@@ -109,7 +123,7 @@ Buildx allows you to create new instances of isolated builders. This can be used
 
 New instances can be created with `docker buildx create` command. This will create a new builder instance with a single node based on your current configuration. To use a remote node you can specify the `DOCKER_HOST` or remote context name while creating the new builder. After creating a new instance you can manage its lifecycle with the `inspect`, `stop` and `rm` commands and list all available builders with `ls`. After creating a new builder you can also append new nodes to it.
 
-To switch between different builders use `docker buildx use <name>`. After running this command the build commands would automatically keep using this builder.
+To switch between different builders, use `docker buildx use <name>`. After running this command the build commands would automatically keep using this builder.
 
 Docker 19.03 also features a new `docker context` command that can be used for giving names for remote Docker API endpoints. Buildx integrates with `docker context` so that all of your contexts automatically get a default builder instance. While creating a new builder instance or when adding a node to it you can also set the context name as the target.
 
@@ -158,6 +172,8 @@ BuildKit has great support for efficiently handling multiple concurrent build re
 Currently, the bake command supports building images from compose files, similar to `compose build` but allowing all the services to be built concurrently as part of a single request.
 
 There is also support for custom build rules from HCL/JSON files allowing better code reuse and different target groups. The design of bake is in very early stages and we are looking for feedback from users.
+
+[`buildx bake` Reference Docs](docs/reference/buildx_bake.md)
 
 # Setting buildx as default builder in Docker 19.03+
 

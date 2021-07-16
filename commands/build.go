@@ -2,15 +2,19 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/appcontext"
@@ -19,6 +23,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
+
+const defaultTargetName = "default"
 
 type buildOptions struct {
 	commonOptions
@@ -63,10 +69,11 @@ type buildOptions struct {
 }
 
 type commonOptions struct {
-	builder  string
-	noCache  *bool
-	progress string
-	pull     *bool
+	builder      string
+	noCache      *bool
+	progress     string
+	pull         *bool
+	metadataFile string
 	// golangci-lint#826
 	// nolint:structcheck
 	exportPush bool
@@ -74,7 +81,7 @@ type commonOptions struct {
 	exportLoad bool
 }
 
-func runBuild(dockerCli command.Cli, in buildOptions) error {
+func runBuild(dockerCli command.Cli, in buildOptions) (err error) {
 	if in.squash {
 		return errors.Errorf("squash currently not implemented")
 	}
@@ -83,6 +90,14 @@ func runBuild(dockerCli command.Cli, in buildOptions) error {
 	}
 
 	ctx := appcontext.Context()
+
+	ctx, end, err := tracing.TraceCurrentCommand(ctx, "build")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		end(err)
+	}()
 
 	noCache := false
 	if in.noCache != nil {
@@ -118,19 +133,23 @@ func runBuild(dockerCli command.Cli, in buildOptions) error {
 
 	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(os.Stderr))
 
-	secrets, err := build.ParseSecretSpecs(in.secrets)
+	secrets, err := buildflags.ParseSecretSpecs(in.secrets)
 	if err != nil {
 		return err
 	}
 	opts.Session = append(opts.Session, secrets)
 
-	ssh, err := build.ParseSSHSpecs(in.ssh)
+	sshSpecs := in.ssh
+	if len(sshSpecs) == 0 && buildflags.IsGitSSH(in.contextPath) {
+		sshSpecs = []string{"default"}
+	}
+	ssh, err := buildflags.ParseSSHSpecs(sshSpecs)
 	if err != nil {
 		return err
 	}
 	opts.Session = append(opts.Session, ssh)
 
-	outputs, err := build.ParseOutputs(in.outputs)
+	outputs, err := buildflags.ParseOutputs(in.outputs)
 	if err != nil {
 		return err
 	}
@@ -171,19 +190,19 @@ func runBuild(dockerCli command.Cli, in buildOptions) error {
 
 	opts.Exports = outputs
 
-	cacheImports, err := build.ParseCacheEntry(in.cacheFrom)
+	cacheImports, err := buildflags.ParseCacheEntry(in.cacheFrom)
 	if err != nil {
 		return err
 	}
 	opts.CacheFrom = cacheImports
 
-	cacheExports, err := build.ParseCacheEntry(in.cacheTo)
+	cacheExports, err := buildflags.ParseCacheEntry(in.cacheTo)
 	if err != nil {
 		return err
 	}
 	opts.CacheTo = cacheExports
 
-	allow, err := build.ParseEntitlements(in.allow)
+	allow, err := buildflags.ParseEntitlements(in.allow)
 	if err != nil {
 		return err
 	}
@@ -195,10 +214,10 @@ func runBuild(dockerCli command.Cli, in buildOptions) error {
 		contextPathHash = in.contextPath
 	}
 
-	return buildTargets(ctx, dockerCli, map[string]build.Options{"default": opts}, in.progress, contextPathHash, in.builder)
+	return buildTargets(ctx, dockerCli, map[string]build.Options{defaultTargetName: opts}, in.progress, contextPathHash, in.builder, in.metadataFile)
 }
 
-func buildTargets(ctx context.Context, dockerCli command.Cli, opts map[string]build.Options, progressMode, contextPathHash, instance string) error {
+func buildTargets(ctx context.Context, dockerCli command.Cli, opts map[string]build.Options, progressMode, contextPathHash, instance string, metadataFile string) error {
 	dis, err := getInstanceOrDefault(ctx, dockerCli, instance, contextPathHash)
 	if err != nil {
 		return err
@@ -208,10 +227,23 @@ func buildTargets(ctx context.Context, dockerCli command.Cli, opts map[string]bu
 	defer cancel()
 	printer := progress.NewPrinter(ctx2, os.Stderr, progressMode)
 
-	_, err = build.Build(ctx, dis, opts, dockerAPI(dockerCli), dockerCli.ConfigFile(), printer)
+	resp, err := build.Build(ctx, dis, opts, dockerAPI(dockerCli), dockerCli.ConfigFile(), printer)
 	err1 := printer.Wait()
 	if err == nil {
 		err = err1
+	}
+	if err != nil {
+		return err
+	}
+
+	if len(metadataFile) > 0 && resp != nil {
+		mdatab, err := json.MarshalIndent(resp[defaultTargetName].ExporterResponse, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := ioutils.AtomicWriteFile(metadataFile, mdatab, 0644); err != nil {
+			return err
+		}
 	}
 
 	return err
@@ -328,6 +360,7 @@ func commonBuildFlags(options *commonOptions, flags *pflag.FlagSet) {
 	flags.StringVar(&options.progress, "progress", defaultProgress, "Set type of progress output (auto, plain, tty). Use plain to show container output")
 
 	options.pull = flags.Bool("pull", false, "Always attempt to pull a newer version of the image")
+	flags.StringVar(&options.metadataFile, "metadata-file", "", "Write build result metadata to the file")
 }
 
 func listToMap(values []string, defaultEnv bool) map[string]string {
