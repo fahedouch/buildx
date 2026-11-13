@@ -1,12 +1,13 @@
 package opts
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/docker/cli/pkg/kvfile"
+	"github.com/moby/moby/api/types/container"
 )
 
 // ReadKVStrings reads a file of line terminated key=value pairs, and overrides any keys
@@ -25,7 +26,7 @@ func ReadKVEnvStrings(files []string, override []string) ([]string, error) {
 func readKVStrings(files []string, override []string, emptyFn func(string) (string, bool)) ([]string, error) {
 	var variables []string
 	for _, ef := range files {
-		parsedVars, err := parseKeyValueFile(ef, emptyFn)
+		parsedVars, err := kvfile.Parse(ef, emptyFn)
 		if err != nil {
 			return nil, err
 		}
@@ -41,12 +42,8 @@ func readKVStrings(files []string, override []string, emptyFn func(string) (stri
 func ConvertKVStringsToMap(values []string) map[string]string {
 	result := make(map[string]string, len(values))
 	for _, value := range values {
-		kv := strings.SplitN(value, "=", 2)
-		if len(kv) == 1 {
-			result[kv[0]] = ""
-		} else {
-			result[kv[0]] = kv[1]
-		}
+		k, v, _ := strings.Cut(value, "=")
+		result[k] = v
 	}
 
 	return result
@@ -55,45 +52,54 @@ func ConvertKVStringsToMap(values []string) map[string]string {
 // ConvertKVStringsToMapWithNil converts ["key=value"] to {"key":"value"}
 // but set unset keys to nil - meaning the ones with no "=" in them.
 // We use this in cases where we need to distinguish between
-//   FOO=  and FOO
+//
+//	FOO=  and FOO
+//
 // where the latter case just means FOO was mentioned but not given a value
 func ConvertKVStringsToMapWithNil(values []string) map[string]*string {
 	result := make(map[string]*string, len(values))
 	for _, value := range values {
-		kv := strings.SplitN(value, "=", 2)
-		if len(kv) == 1 {
-			result[kv[0]] = nil
+		k, v, ok := strings.Cut(value, "=")
+		if !ok {
+			result[k] = nil
 		} else {
-			result[kv[0]] = &kv[1]
+			result[k] = &v
 		}
 	}
 
 	return result
 }
 
-// ParseRestartPolicy returns the parsed policy or an error indicating what is incorrect
+// ParseRestartPolicy parses a restart policy string ("name[:max-retries]")
+// into a [container.RestartPolicy].
+//
+// Parsing is syntactic only; semantic validation is deferred to the daemon/API.
+// An empty input returns a zero-value policy for backward compatibility. The
+// retry count, if set, must be an integer (negative values are allowed here
+// but may be rejected by the daemon).
 func ParseRestartPolicy(policy string) (container.RestartPolicy, error) {
-	p := container.RestartPolicy{}
-
 	if policy == "" {
-		return p, nil
+		// For backward compatibility, do not set an explicit default ("no"),
+		// as older daemons may not support it.
+		return container.RestartPolicy{}, nil
 	}
 
-	parts := strings.Split(policy, ":")
-
-	if len(parts) > 2 {
-		return p, fmt.Errorf("invalid restart policy format")
+	name, count, ok := strings.Cut(policy, ":")
+	if ok && name == "" {
+		return container.RestartPolicy{}, errors.New("invalid restart policy format: no policy provided before colon")
 	}
-	if len(parts) == 2 {
-		count, err := strconv.Atoi(parts[1])
+
+	var retryCount int
+	if count != "" {
+		c, err := strconv.Atoi(count)
 		if err != nil {
-			return p, fmt.Errorf("maximum retry count must be an integer")
+			return container.RestartPolicy{}, errors.New("invalid restart policy format: maximum retry count must be an integer")
 		}
-
-		p.MaximumRetryCount = count
+		retryCount = c
 	}
 
-	p.Name = parts[0]
-
-	return p, nil
+	return container.RestartPolicy{
+		Name:              container.RestartPolicyMode(name),
+		MaximumRetryCount: retryCount,
+	}, nil
 }

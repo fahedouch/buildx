@@ -3,15 +3,15 @@ package platformutil
 import (
 	"strings"
 
-	"github.com/containerd/containerd/platforms"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/containerd/platforms"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func Parse(platformsStr []string) ([]specs.Platform, error) {
+func Parse(platformsStr []string) ([]ocispecs.Platform, error) {
 	if len(platformsStr) == 0 {
 		return nil, nil
 	}
-	out := make([]specs.Platform, 0, len(platformsStr))
+	out := make([]ocispecs.Platform, 0, len(platformsStr))
 	for _, s := range platformsStr {
 		parts := strings.Split(s, ",")
 		if len(parts) > 1 {
@@ -31,19 +31,26 @@ func Parse(platformsStr []string) ([]specs.Platform, error) {
 	return out, nil
 }
 
-func parse(in string) (specs.Platform, error) {
+func parse(in string) (ocispecs.Platform, error) {
 	if strings.EqualFold(in, "local") {
 		return platforms.DefaultSpec(), nil
 	}
 	return platforms.Parse(in)
 }
 
-func Dedupe(in []specs.Platform) []specs.Platform {
+// Key returns the canonical string identifying a platform. Unlike
+// [platforms.Format] it keeps the OS version and OS features so that Windows
+// platforms from different releases do not collapse into each other.
+func Key(p ocispecs.Platform) string {
+	return platforms.FormatAll(platforms.Normalize(p))
+}
+
+func Dedupe(in []ocispecs.Platform) []ocispecs.Platform {
 	m := map[string]struct{}{}
-	out := make([]specs.Platform, 0, len(in))
+	out := make([]ocispecs.Platform, 0, len(in))
 	for _, p := range in {
 		p := platforms.Normalize(p)
-		key := platforms.Format(p)
+		key := Key(p)
 		if _, ok := m[key]; ok {
 			continue
 		}
@@ -53,18 +60,16 @@ func Dedupe(in []specs.Platform) []specs.Platform {
 	return out
 }
 
-func FormatInGroups(gg ...[]specs.Platform) []string {
+func FormatInGroups(gg ...[]ocispecs.Platform) []string {
 	m := map[string]struct{}{}
 	out := make([]string, 0, len(gg))
 	for i, g := range gg {
 		for _, p := range g {
-			p := platforms.Normalize(p)
-			key := platforms.Format(p)
-			if _, ok := m[key]; ok {
+			v := Key(p)
+			if _, ok := m[v]; ok {
 				continue
 			}
-			m[key] = struct{}{}
-			v := platforms.Format(p)
+			m[v] = struct{}{}
 			if i == 0 {
 				v += "*"
 			}
@@ -74,13 +79,13 @@ func FormatInGroups(gg ...[]specs.Platform) []string {
 	return out
 }
 
-func Format(in []specs.Platform) []string {
+func Format(in []ocispecs.Platform) []string {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(in))
 	for _, p := range in {
-		out = append(out, platforms.Format(p))
+		out = append(out, Key(p))
 	}
 	return out
 }

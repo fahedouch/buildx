@@ -1,14 +1,19 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.26
+
 // Package connhelper provides helpers for connecting to a remote daemon host with custom logic.
 package connhelper
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/url"
+	"slices"
+	"strings"
 
 	"github.com/docker/cli/cli/connhelper/commandconn"
 	"github.com/docker/cli/cli/connhelper/ssh"
-	"github.com/pkg/errors"
 )
 
 // ConnectionHelper allows to connect to a remote host with custom stream provider binary.
@@ -39,17 +44,28 @@ func getConnectionHelper(daemonURL string, sshFlags []string) (*ConnectionHelper
 	if err != nil {
 		return nil, err
 	}
-	switch scheme := u.Scheme; scheme {
-	case "ssh":
-		sp, err := ssh.ParseURL(daemonURL)
+	if u.Scheme == "ssh" {
+		sp, err := ssh.NewSpec(u)
 		if err != nil {
-			return nil, errors.Wrap(err, "ssh host connection is not valid")
+			return nil, fmt.Errorf("ssh host connection is not valid: %w", err)
+		}
+		sshFlags = addSSHTimeout(sshFlags)
+		sshFlags = disablePseudoTerminalAllocation(sshFlags)
+
+		remoteCommand := []string{"docker", "system", "dial-stdio"}
+		socketPath := sp.Path
+		if strings.Trim(sp.Path, "/") != "" {
+			remoteCommand = []string{"docker", "--host=unix://" + socketPath, "system", "dial-stdio"}
+		}
+		sshArgs, err := sp.Command(sshFlags, remoteCommand...)
+		if err != nil {
+			return nil, err
 		}
 		return &ConnectionHelper{
 			Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return commandconn.New(ctx, "ssh", append(sshFlags, sp.Args("docker", "system", "dial-stdio")...)...)
+				return commandconn.New(ctx, "ssh", sshArgs...)
 			},
-			Host: "http://docker",
+			Host: "http://docker.example.com",
 		}, nil
 	}
 	// Future version may support plugins via ~/.docker/config.json. e.g. "dind"
@@ -63,6 +79,22 @@ func GetCommandConnectionHelper(cmd string, flags ...string) (*ConnectionHelper,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return commandconn.New(ctx, cmd, flags...)
 		},
-		Host: "http://docker",
+		Host: "http://docker.example.com",
 	}, nil
+}
+
+func addSSHTimeout(sshFlags []string) []string {
+	if !strings.Contains(strings.Join(sshFlags, ""), "ConnectTimeout") {
+		sshFlags = append(sshFlags, "-o ConnectTimeout=30")
+	}
+	return sshFlags
+}
+
+// disablePseudoTerminalAllocation disables pseudo-terminal allocation to
+// prevent SSH from executing as a login shell
+func disablePseudoTerminalAllocation(sshFlags []string) []string {
+	if slices.Contains(sshFlags, "-T") {
+		return sshFlags
+	}
+	return append(sshFlags, "-T")
 }

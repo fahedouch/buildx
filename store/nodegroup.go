@@ -2,11 +2,15 @@ package store
 
 import (
 	"fmt"
+	"maps"
+	"slices"
+	"time"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/platformutil"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type NodeGroup struct {
@@ -14,15 +18,20 @@ type NodeGroup struct {
 	Driver  string
 	Nodes   []Node
 	Dynamic bool
+
+	// skip the following fields from being saved in the store
+	DockerContext bool      `json:"-"`
+	LastActivity  time.Time `json:"-"`
 }
 
 type Node struct {
-	Name       string
-	Endpoint   string
-	Platforms  []specs.Platform
-	Flags      []string
-	ConfigFile string
-	DriverOpts map[string]string
+	Name           string
+	Endpoint       string
+	Platforms      []ocispecs.Platform
+	DriverOpts     map[string]string
+	BuildkitdFlags []string `json:"Flags"` // keep the field name for backward compatibility
+
+	Files map[string][]byte
 }
 
 func (ng *NodeGroup) Leave(name string) error {
@@ -36,11 +45,11 @@ func (ng *NodeGroup) Leave(name string) error {
 	if len(ng.Nodes) == 1 {
 		return errors.Errorf("can not leave last node, do you want to rm instance instead?")
 	}
-	ng.Nodes = append(ng.Nodes[:i], ng.Nodes[i+1:]...)
+	ng.Nodes = slices.Delete(ng.Nodes, i, i+1)
 	return nil
 }
 
-func (ng *NodeGroup) Update(name, endpoint string, platforms []string, endpointsSet bool, actionAppend bool, flags []string, configFile string, do map[string]string) error {
+func (ng *NodeGroup) Update(name, endpoint string, platforms []string, endpointsSet bool, actionAppend bool, buildkitdFlags []string, buildkitdConfigFile string, do map[string]string) error {
 	if ng.Dynamic {
 		return errors.New("dynamic node group does not support Update")
 	}
@@ -57,22 +66,42 @@ func (ng *NodeGroup) Update(name, endpoint string, platforms []string, endpoints
 		return err
 	}
 
+	var files map[string][]byte
+	if buildkitdConfigFile != "" {
+		files, err = confutil.LoadConfigFiles(buildkitdConfigFile)
+		if err != nil {
+			return err
+		}
+	}
+
 	if i != -1 {
 		n := ng.Nodes[i]
+		needsRestart := false
 		if endpointsSet {
 			n.Endpoint = endpoint
+			needsRestart = true
 		}
 		if len(platforms) > 0 {
 			n.Platforms = pp
 		}
-		if flags != nil {
-			n.Flags = flags
+		if buildkitdFlags != nil {
+			n.BuildkitdFlags = buildkitdFlags
+			needsRestart = true
 		}
+		if do != nil {
+			n.DriverOpts = do
+			needsRestart = true
+		}
+		if buildkitdConfigFile != "" {
+			maps.Copy(n.Files, files)
+			needsRestart = true
+		}
+		if needsRestart {
+			logrus.Warn("new settings may not be used until builder is restarted")
+		}
+
 		ng.Nodes[i] = n
-		if err := ng.validateDuplicates(endpoint, i); err != nil {
-			return err
-		}
-		return nil
+		return ng.validateDuplicates(endpoint, i)
 	}
 
 	if name == "" {
@@ -85,19 +114,52 @@ func (ng *NodeGroup) Update(name, endpoint string, platforms []string, endpoints
 	}
 
 	n := Node{
-		Name:       name,
-		Endpoint:   endpoint,
-		Platforms:  pp,
-		ConfigFile: configFile,
-		Flags:      flags,
-		DriverOpts: do,
+		Name:           name,
+		Endpoint:       endpoint,
+		Platforms:      pp,
+		DriverOpts:     do,
+		BuildkitdFlags: buildkitdFlags,
+		Files:          files,
 	}
-	ng.Nodes = append(ng.Nodes, n)
 
-	if err := ng.validateDuplicates(endpoint, len(ng.Nodes)-1); err != nil {
-		return err
+	ng.Nodes = append(ng.Nodes, n)
+	return ng.validateDuplicates(endpoint, len(ng.Nodes)-1)
+}
+
+func (ng *NodeGroup) Copy() *NodeGroup {
+	nodes := make([]Node, len(ng.Nodes))
+	for i, node := range ng.Nodes {
+		nodes[i] = *node.Copy()
 	}
-	return nil
+	return &NodeGroup{
+		Name:    ng.Name,
+		Driver:  ng.Driver,
+		Nodes:   nodes,
+		Dynamic: ng.Dynamic,
+	}
+}
+
+func (n *Node) Copy() *Node {
+	platforms := []ocispecs.Platform{}
+	copy(platforms, n.Platforms)
+	buildkitdFlags := []string{}
+	copy(buildkitdFlags, n.BuildkitdFlags)
+	driverOpts := map[string]string{}
+	maps.Copy(driverOpts, n.DriverOpts)
+	files := map[string][]byte{}
+	for k, v := range n.Files {
+		vv := []byte{}
+		copy(vv, v)
+		files[k] = vv
+	}
+	return &Node{
+		Name:           n.Name,
+		Endpoint:       n.Endpoint,
+		Platforms:      platforms,
+		BuildkitdFlags: buildkitdFlags,
+		DriverOpts:     driverOpts,
+		Files:          files,
+	}
 }
 
 func (ng *NodeGroup) validateDuplicates(ep string, idx int) error {
@@ -113,7 +175,7 @@ func (ng *NodeGroup) validateDuplicates(ep string, idx int) error {
 
 	m := map[string]struct{}{}
 	for _, p := range ng.Nodes[idx].Platforms {
-		m[platforms.Format(p)] = struct{}{}
+		m[platformutil.Key(p)] = struct{}{}
 	}
 
 	for i := range ng.Nodes {
@@ -147,10 +209,10 @@ func (ng *NodeGroup) nextNodeName() string {
 	}
 }
 
-func filterPlatforms(in []specs.Platform, m map[string]struct{}) []specs.Platform {
-	out := make([]specs.Platform, 0, len(in))
+func filterPlatforms(in []ocispecs.Platform, m map[string]struct{}) []ocispecs.Platform {
+	out := make([]ocispecs.Platform, 0, len(in))
 	for _, p := range in {
-		if _, ok := m[platforms.Format(p)]; !ok {
+		if _, ok := m[platformutil.Key(p)]; !ok {
 			out = append(out, p)
 		}
 	}

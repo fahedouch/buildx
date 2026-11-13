@@ -1,13 +1,16 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.26
+
 package opts
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/pkg/errors"
+	"github.com/moby/moby/api/types/container"
 )
 
 // GpuOpts is a Value type for parsing mounts
@@ -20,11 +23,18 @@ func parseCount(s string) (int, error) {
 		return -1, nil
 	}
 	i, err := strconv.Atoi(s)
-	return i, errors.Wrap(err, "count must be an integer")
+	if err != nil {
+		if numErr, ok := errors.AsType[*strconv.NumError](err); ok {
+			err = numErr.Err
+		}
+		return 0, fmt.Errorf(`invalid count (%s): value must be either "all" or an integer: %w`, s, err)
+	}
+	return i, nil
 }
 
 // Set a new mount value
-// nolint: gocyclo
+//
+//nolint:gocyclo
 func (o *GpuOpts) Set(value string) error {
 	csvReader := csv.NewReader(strings.NewReader(value))
 	fields, err := csvReader.Read()
@@ -37,14 +47,13 @@ func (o *GpuOpts) Set(value string) error {
 	seen := map[string]struct{}{}
 	// Set writable as the default
 	for _, field := range fields {
-		parts := strings.SplitN(field, "=", 2)
-		key := parts[0]
+		key, val, withValue := strings.Cut(field, "=")
 		if _, ok := seen[key]; ok {
 			return fmt.Errorf("gpu request key '%s' can be specified only once", key)
 		}
 		seen[key] = struct{}{}
 
-		if len(parts) == 1 {
+		if !withValue {
 			seen["count"] = struct{}{}
 			req.Count, err = parseCount(key)
 			if err != nil {
@@ -53,24 +62,23 @@ func (o *GpuOpts) Set(value string) error {
 			continue
 		}
 
-		value := parts[1]
 		switch key {
 		case "driver":
-			req.Driver = value
+			req.Driver = val
 		case "count":
-			req.Count, err = parseCount(value)
+			req.Count, err = parseCount(val)
 			if err != nil {
 				return err
 			}
 		case "device":
-			req.DeviceIDs = strings.Split(value, ",")
+			req.DeviceIDs = strings.Split(val, ",")
 		case "capabilities":
-			req.Capabilities = [][]string{append(strings.Split(value, ","), "gpu")}
+			req.Capabilities = [][]string{append(strings.Split(val, ","), "gpu")}
 		case "options":
-			r := csv.NewReader(strings.NewReader(value))
+			r := csv.NewReader(strings.NewReader(val))
 			optFields, err := r.Read()
 			if err != nil {
-				return errors.Wrap(err, "failed to read gpu options")
+				return fmt.Errorf("failed to read gpu options: %w", err)
 			}
 			req.Options = ConvertKVStringsToMap(optFields)
 		default:
@@ -93,13 +101,13 @@ func (o *GpuOpts) Set(value string) error {
 }
 
 // Type returns the type of this option
-func (o *GpuOpts) Type() string {
+func (*GpuOpts) Type() string {
 	return "gpu-request"
 }
 
 // String returns a string repr of this option
 func (o *GpuOpts) String() string {
-	gpus := []string{}
+	gpus := make([]string, 0, len(o.values))
 	for _, gpu := range o.values {
 		gpus = append(gpus, fmt.Sprintf("%v", gpu))
 	}

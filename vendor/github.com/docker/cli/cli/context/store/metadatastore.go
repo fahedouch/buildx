@@ -1,15 +1,19 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.26
+
 package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 
 	"github.com/fvbommel/sortorder"
+	"github.com/moby/sys/atomicwriter"
 )
 
 const (
@@ -28,22 +32,22 @@ func (s *metadataStore) contextDir(id contextdir) string {
 
 func (s *metadataStore) createOrUpdate(meta Metadata) error {
 	contextDir := s.contextDir(contextdirOf(meta.Name))
-	if err := os.MkdirAll(contextDir, 0755); err != nil {
+	if err := os.MkdirAll(contextDir, 0o755); err != nil {
 		return err
 	}
 	bytes, err := json.Marshal(&meta)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filepath.Join(contextDir, metaFile), bytes, 0644)
+	return atomicwriter.WriteFile(filepath.Join(contextDir, metaFile), bytes, 0o644)
 }
 
-func parseTypedOrMap(payload []byte, getter TypeGetter) (interface{}, error) {
+func parseTypedOrMap(payload []byte, getter TypeGetter) (any, error) {
 	if len(payload) == 0 || string(payload) == "null" {
 		return nil, nil
 	}
 	if getter == nil {
-		var res map[string]interface{}
+		var res map[string]any
 		if err := json.Unmarshal(payload, &res); err != nil {
 			return nil, err
 		}
@@ -56,54 +60,70 @@ func parseTypedOrMap(payload []byte, getter TypeGetter) (interface{}, error) {
 	return reflect.ValueOf(typed).Elem().Interface(), nil
 }
 
-func (s *metadataStore) get(id contextdir) (Metadata, error) {
-	contextDir := s.contextDir(id)
-	bytes, err := ioutil.ReadFile(filepath.Join(contextDir, metaFile))
+func (s *metadataStore) get(name string) (Metadata, error) {
+	m, err := s.getByID(contextdirOf(name))
 	if err != nil {
-		return Metadata{}, convertContextDoesNotExist(err)
+		return m, fmt.Errorf("context %q: %w", name, err)
+	}
+	return m, nil
+}
+
+func (s *metadataStore) getByID(id contextdir) (Metadata, error) {
+	fileName := filepath.Join(s.contextDir(id), metaFile)
+	bytes, err := os.ReadFile(fileName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Metadata{}, notFound(fmt.Errorf("context not found: %w", err))
+		}
+		return Metadata{}, err
 	}
 	var untyped untypedContextMetadata
 	r := Metadata{
-		Endpoints: make(map[string]interface{}),
+		Endpoints: make(map[string]any),
 	}
 	if err := json.Unmarshal(bytes, &untyped); err != nil {
-		return Metadata{}, err
+		return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 	}
 	r.Name = untyped.Name
 	if r.Metadata, err = parseTypedOrMap(untyped.Metadata, s.config.contextType); err != nil {
-		return Metadata{}, err
+		return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 	}
 	for k, v := range untyped.Endpoints {
 		if r.Endpoints[k], err = parseTypedOrMap(v, s.config.endpointTypes[k]); err != nil {
-			return Metadata{}, err
+			return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 		}
 	}
 	return r, err
 }
 
-func (s *metadataStore) remove(id contextdir) error {
-	contextDir := s.contextDir(id)
-	return os.RemoveAll(contextDir)
+func (s *metadataStore) remove(name string) error {
+	if err := os.RemoveAll(s.contextDir(contextdirOf(name))); err != nil {
+		return fmt.Errorf("failed to remove metadata: %w", err)
+	}
+	return nil
 }
 
 func (s *metadataStore) list() ([]Metadata, error) {
 	ctxDirs, err := listRecursivelyMetadataDirs(s.root)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var res []Metadata
+	res := make([]Metadata, 0, len(ctxDirs))
 	for _, dir := range ctxDirs {
-		c, err := s.get(contextdir(dir))
+		c, err := s.getByID(contextdir(dir))
 		if err != nil {
-			return nil, err
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to read metadata: %w", err)
 		}
 		res = append(res, c)
 	}
-	sort.Slice(res, func(i, j int) bool {
-		return sortorder.NaturalLess(res[i].Name, res[j].Name)
+	slices.SortFunc(res, func(a, b Metadata) int {
+		return sortorder.NaturalCompare(a.Name, b.Name)
 	})
 	return res, nil
 }
@@ -117,7 +137,7 @@ func isContextDir(path string) bool {
 }
 
 func listRecursivelyMetadataDirs(root string) ([]string, error) {
-	fis, err := ioutil.ReadDir(root)
+	fis, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -132,18 +152,11 @@ func listRecursivelyMetadataDirs(root string) ([]string, error) {
 				return nil, err
 			}
 			for _, s := range subs {
-				result = append(result, fmt.Sprintf("%s/%s", fi.Name(), s))
+				result = append(result, filepath.Join(fi.Name(), s))
 			}
 		}
 	}
 	return result, nil
-}
-
-func convertContextDoesNotExist(err error) error {
-	if os.IsNotExist(err) {
-		return &contextDoesNotExistError{}
-	}
-	return err
 }
 
 type untypedContextMetadata struct {

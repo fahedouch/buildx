@@ -1,0 +1,69 @@
+# this workflow runs the remote validate bake target from docker/docker.github.io
+# to check if yaml reference docs and markdown files used in this repo are still valid
+# https://github.com/docker/docker.github.io/blob/98c7c9535063ae4cd2cd0a31478a21d16d2f07a3/docker-bake.hcl#L34-L36
+name: docs-upstream
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'v[0-9]*'
+    paths:
+      - '.github/workflows/docs-upstream.yml'
+      - 'docs/**'
+  pull_request:
+    paths:
+      - '.github/workflows/docs-upstream.yml'
+      - 'docs/**'
+
+env:
+  SETUP_BUILDX_VERSION: "edge"
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
+
+jobs:
+  docs-yaml:
+    runs-on: ubuntu-26.04
+    steps:
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        name: Build reference YAML docs
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          targets: update-docs
+          provenance: false
+          set: |
+            *.output=/tmp/buildx-docs
+            *.cache-from=type=gha,scope=docs-yaml
+            *.cache-to=type=gha,scope=docs-yaml,mode=max
+        env:
+          DOCS_FORMATS: yaml
+      -
+        name: Upload reference YAML docs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-yaml
+          path: /tmp/buildx-docs/out/reference
+          retention-days: 1
+
+  validate:
+    uses: docker/docs/.github/workflows/validate-upstream.yml@main # zizmor: ignore[unpinned-uses] needs to validate against latest docs changes
+    needs:
+      - docs-yaml
+    with:
+      module-name: docker/buildx
+      data-files-id: docs-yaml
+      data-files-folder: buildx
+      create-placeholder-stubs: true

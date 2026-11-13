@@ -112,7 +112,7 @@ func (t typeObject) GoString() string {
 		return "cty.EmptyObject"
 	}
 	if len(t.AttrOptional) > 0 {
-		opt := make([]string, len(t.AttrOptional))
+		var opt []string
 		for k := range t.AttrOptional {
 			opt = append(opt, k)
 		}
@@ -134,7 +134,7 @@ func init() {
 	EmptyObject = Object(map[string]Type{})
 	EmptyObjectVal = Value{
 		ty: EmptyObject,
-		v:  map[string]interface{}{},
+		v:  map[string]any{},
 	}
 }
 

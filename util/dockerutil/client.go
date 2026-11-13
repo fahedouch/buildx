@@ -1,0 +1,122 @@
+package dockerutil
+
+import (
+	"context"
+	"io"
+	"sync"
+
+	"github.com/docker/buildx/util/progress"
+	"github.com/docker/cli/cli/command"
+	"github.com/moby/buildkit/util/flightcontrol"
+	dockerclient "github.com/moby/moby/client"
+)
+
+// Client represents an active docker object.
+type Client struct {
+	cli command.Cli
+
+	features flightcontrol.CachedGroup[map[Feature]bool]
+}
+
+// NewClient initializes a new docker client.
+func NewClient(cli command.Cli) *Client {
+	return &Client{cli: cli}
+}
+
+// API returns a new docker API client.
+func (c *Client) API(name string) (dockerclient.APIClient, error) {
+	if name == "" {
+		name = c.cli.CurrentContext()
+	}
+	return NewClientAPI(c.cli, name)
+}
+
+// LoadImage imports an image to docker.
+func (c *Client) LoadImage(ctx context.Context, name string, status progress.Writer) (io.WriteCloser, func(), error) {
+	dapi, err := c.API(name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+
+	var w *waitingWriter
+	w = &waitingWriter{
+		PipeWriter: pw,
+		f: func() {
+			handleErr := func(err error) {
+				pr.CloseWithError(err)
+				w.mu.Lock()
+				w.err = err
+				w.mu.Unlock()
+			}
+
+			resp, err := dapi.ImageLoad(ctx, pr)
+			defer close(done)
+			if err != nil {
+				handleErr(err)
+				return
+			}
+
+			status = progress.ResetTime(status)
+			if err := progress.Wrap("importing to docker", status.Write, func(l progress.SubLogger) error {
+				return loadProgressFromReader(l, resp)
+			}); err != nil {
+				handleErr(err)
+			}
+		},
+		done: done,
+	}
+	return w, func() {
+		pr.Close()
+	}, nil
+}
+
+func (c *Client) Features(ctx context.Context, name string) (map[Feature]bool, error) {
+	if name == "" {
+		name = c.cli.CurrentContext()
+	}
+	return c.features.Do(ctx, name, func(ctx context.Context) (map[Feature]bool, error) {
+		dapi, err := c.API(name)
+		if err != nil {
+			return nil, err
+		}
+		defer dapi.Close()
+		res, err := dapi.Info(ctx, dockerclient.InfoOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return map[Feature]bool{OCIImporter: HasOCIImporter(res.Info)}, nil
+	})
+}
+
+type waitingWriter struct {
+	*io.PipeWriter
+	f    func()
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+	done chan struct{}
+}
+
+func (w *waitingWriter) Write(dt []byte) (int, error) {
+	w.once.Do(func() {
+		go w.f()
+	})
+	return w.PipeWriter.Write(dt)
+}
+
+func (w *waitingWriter) Close() error {
+	err := w.PipeWriter.Close()
+	w.once.Do(func() {
+		close(w.done)
+	})
+	<-w.done
+	if err == nil {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.err
+	}
+	return err
+}

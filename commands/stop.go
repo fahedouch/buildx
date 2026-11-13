@@ -1,9 +1,12 @@
 package commands
 
 import (
+	"context"
+
+	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/util/appcontext"
 	"github.com/spf13/cobra"
 )
 
@@ -11,35 +14,20 @@ type stopOptions struct {
 	builder string
 }
 
-func runStop(dockerCli command.Cli, in stopOptions) error {
-	ctx := appcontext.Context()
-
-	txn, release, err := getStore(dockerCli)
+func runStop(ctx context.Context, dockerCli command.Cli, in stopOptions) error {
+	b, err := builder.New(dockerCli,
+		builder.WithName(in.builder),
+		builder.WithSkippedValidation(),
+	)
 	if err != nil {
 		return err
 	}
-	defer release()
-
-	if in.builder != "" {
-		ng, err := getNodeGroup(txn, dockerCli, in.builder)
-		if err != nil {
-			return err
-		}
-		if err := stop(ctx, dockerCli, ng, false); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	ng, err := getCurrentInstance(txn, dockerCli)
+	nodes, err := b.LoadNodes(ctx)
 	if err != nil {
 		return err
 	}
-	if ng != nil {
-		return stop(ctx, dockerCli, ng, false)
-	}
 
-	return stopCurrent(ctx, dockerCli, false)
+	return stop(ctx, nodes)
 }
 
 func stopCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
@@ -54,15 +42,25 @@ func stopCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			if len(args) > 0 {
 				options.builder = args[0]
 			}
-			return runStop(dockerCli, options)
+			return runStop(cmd.Context(), dockerCli, options)
 		},
+		ValidArgsFunction:     completion.BuilderNames(dockerCli),
+		DisableFlagsInUseLine: true,
 	}
 
-	flags := cmd.Flags()
-
-	// flags.StringArrayVarP(&options.outputs, "output", "o", []string{}, "Output destination (format: type=local,dest=path)")
-
-	_ = flags
-
 	return cmd
+}
+
+func stop(ctx context.Context, nodes []builder.Node) (err error) {
+	for _, node := range nodes {
+		if node.Driver != nil {
+			if err := node.Driver.Stop(ctx, true); err != nil {
+				return err
+			}
+		}
+		if node.Err != nil {
+			err = node.Err
+		}
+	}
+	return err
 }

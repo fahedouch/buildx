@@ -1,214 +1,217 @@
 package command
 
 import (
-	"bufio"
 	"context"
-	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/distribution/reference"
+	"github.com/docker/cli/cli/config/configfile"
+	"github.com/docker/cli/cli/config/credentials"
 	configtypes "github.com/docker/cli/cli/config/types"
-	"github.com/docker/cli/cli/debug"
+	"github.com/docker/cli/cli/hints"
 	"github.com/docker/cli/cli/streams"
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	registrytypes "github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/registry"
-	"github.com/moby/term"
-	"github.com/pkg/errors"
+	"github.com/docker/cli/internal/prompt"
+	"github.com/docker/cli/internal/tui"
+	"github.com/moby/moby/api/pkg/authconfig"
+	registrytypes "github.com/moby/moby/api/types/registry"
+	"github.com/morikuni/aec"
 )
 
-// ElectAuthServer returns the default registry to use (by asking the daemon)
-func ElectAuthServer(ctx context.Context, cli Cli) string {
-	// The daemon `/info` endpoint informs us of the default registry being
-	// used. This is essential in cross-platforms environment, where for
-	// example a Linux client might be interacting with a Windows daemon, hence
-	// the default registry URL might be Windows specific.
-	info, err := cli.Client().Info(ctx)
-	if err != nil {
-		// Daemon is not responding so use system default.
-		if debug.IsEnabled() {
-			// Only report the warning if we're in debug mode to prevent nagging during engine initialization workflows
-			fmt.Fprintf(cli.Err(), "Warning: failed to get default registry endpoint from daemon (%v). Using system default: %s\n", err, registry.IndexServer)
-		}
-		return registry.IndexServer
-	}
-	if info.IndexServerAddress == "" {
-		if debug.IsEnabled() {
-			fmt.Fprintf(cli.Err(), "Warning: Empty registry endpoint from daemon. Using system default: %s\n", registry.IndexServer)
-		}
-		return registry.IndexServer
-	}
-	return info.IndexServerAddress
-}
+const (
+	registerSuggest = "Log in with your Docker ID or email address to push and pull images from Docker Hub. " +
+		"If you don't have a Docker ID, head over to https://hub.docker.com/ to create one."
+	patSuggest = "You can log in with your password or a Personal Access " +
+		"Token (PAT). Using a limited-scope PAT grants better security and is required " +
+		"for organizations using SSO. Learn more at https://docs.docker.com/go/access-tokens/"
+)
 
-// EncodeAuthToBase64 serializes the auth configuration as JSON base64 payload
-func EncodeAuthToBase64(authConfig types.AuthConfig) (string, error) {
-	buf, err := json.Marshal(authConfig)
-	if err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.EncodeToString(buf), nil
-}
+// authConfigKey is the key used to store credentials for Docker Hub. It is
+// a copy of [registry.IndexServer].
+//
+// [registry.IndexServer]: https://pkg.go.dev/github.com/docker/docker@v28.3.3+incompatible/registry#IndexServer
+const authConfigKey = "https://index.docker.io/v1/"
 
-// RegistryAuthenticationPrivilegedFunc returns a RequestPrivilegeFunc from the specified registry index info
-// for the given command.
-func RegistryAuthenticationPrivilegedFunc(cli Cli, index *registrytypes.IndexInfo, cmdName string) types.RequestPrivilegeFunc {
-	return func() (string, error) {
-		fmt.Fprintf(cli.Out(), "\nPlease login prior to %s:\n", cmdName)
-		indexServer := registry.GetAuthConfigKey(index)
-		isDefaultRegistry := indexServer == ElectAuthServer(context.Background(), cli)
-		authConfig, err := GetDefaultAuthConfig(cli, true, indexServer, isDefaultRegistry)
-		if authConfig == nil {
-			authConfig = &types.AuthConfig{}
-		}
-		if err != nil {
-			fmt.Fprintf(cli.Err(), "Unable to retrieve stored credentials for %s, error: %s.\n", indexServer, err)
-		}
-		err = ConfigureAuth(cli, "", "", authConfig, isDefaultRegistry)
-		if err != nil {
-			return "", err
-		}
-		return EncodeAuthToBase64(*authConfig)
-	}
-}
-
-// ResolveAuthConfig is like registry.ResolveAuthConfig, but if using the
-// default index, it uses the default index name for the daemon's platform,
-// not the client's platform.
-func ResolveAuthConfig(ctx context.Context, cli Cli, index *registrytypes.IndexInfo) types.AuthConfig {
+// ResolveAuthConfig returns auth-config for the given registry from the
+// credential-store. It returns an empty AuthConfig if no credentials were
+// found.
+//
+// Deprecated: this function is no longer used, and will be removed in the next release.
+func ResolveAuthConfig(cfg *configfile.ConfigFile, index *registrytypes.IndexInfo) registrytypes.AuthConfig {
 	configKey := index.Name
 	if index.Official {
-		configKey = ElectAuthServer(ctx, cli)
+		configKey = authConfigKey
 	}
 
-	a, _ := cli.ConfigFile().GetAuthConfig(configKey)
-	return types.AuthConfig(a)
+	a, _ := cfg.GetAuthConfig(configKey)
+	return registrytypes.AuthConfig{
+		Username:      a.Username,
+		Password:      a.Password,
+		ServerAddress: a.ServerAddress,
+
+		// TODO(thaJeztah): Are these expected to be included?
+		Auth:          a.Auth,
+		IdentityToken: a.IdentityToken,
+		RegistryToken: a.RegistryToken,
+	}
 }
 
 // GetDefaultAuthConfig gets the default auth config given a serverAddress
 // If credentials for given serverAddress exists in the credential store, the configuration will be populated with values in it
-func GetDefaultAuthConfig(cli Cli, checkCredStore bool, serverAddress string, isDefaultRegistry bool) (*types.AuthConfig, error) {
+func GetDefaultAuthConfig(cfg *configfile.ConfigFile, checkCredStore bool, serverAddress string, isDefaultRegistry bool) (registrytypes.AuthConfig, error) {
 	if !isDefaultRegistry {
-		serverAddress = registry.ConvertToHostname(serverAddress)
+		serverAddress = credentials.ConvertToHostname(serverAddress)
 	}
-	var authconfig = configtypes.AuthConfig{}
+	authCfg := configtypes.AuthConfig{}
 	var err error
 	if checkCredStore {
-		authconfig, err = cli.ConfigFile().GetAuthConfig(serverAddress)
+		authCfg, err = cfg.GetAuthConfig(serverAddress)
 		if err != nil {
-			return nil, err
+			return registrytypes.AuthConfig{
+				ServerAddress: serverAddress,
+			}, err
 		}
 	}
-	authconfig.ServerAddress = serverAddress
-	authconfig.IdentityToken = ""
-	res := types.AuthConfig(authconfig)
-	return &res, nil
+
+	return registrytypes.AuthConfig{
+		Username:      authCfg.Username,
+		Password:      authCfg.Password,
+		ServerAddress: serverAddress,
+
+		// TODO(thaJeztah): Are these expected to be included?
+		Auth:          authCfg.Auth,
+		IdentityToken: "",
+		RegistryToken: authCfg.RegistryToken,
+	}, nil
 }
 
-// ConfigureAuth handles prompting of user's username and password if needed
-func ConfigureAuth(cli Cli, flUser, flPassword string, authconfig *types.AuthConfig, isDefaultRegistry bool) error {
-	// On Windows, force the use of the regular OS stdin stream. Fixes #14336/#14210
+// PromptUserForCredentials handles the CLI prompt for the user to input
+// credentials.
+// If argUser is not empty, then the user is only prompted for their password.
+// If argPassword is not empty, then the user is only prompted for their username
+// If neither argUser nor argPassword are empty, then the user is not prompted and
+// an AuthConfig is returned with those values.
+// If defaultUsername is not empty, the username prompt includes that username
+// and the user can hit enter without inputting a username  to use that default
+// username.
+func PromptUserForCredentials(ctx context.Context, cli Streams, argUser, argPassword, defaultUsername, serverAddress string) (registrytypes.AuthConfig, error) {
+	// On Windows, force the use of the regular OS stdin stream.
+	//
+	// StdStreams() may wrap stdin with windowsconsole.NewAnsiReader to
+	// emulate VT input on consoles that do not support it natively, but
+	// that wrapper has historically caused interactive prompts to hang
+	// or behave incorrectly.
+	//
+	// See:
+	// - https://github.com/moby/moby/issues/14336
+	// - https://github.com/moby/moby/issues/14210
+	// - https://github.com/moby/moby/pull/17738
+	stdIn := cli.In()
 	if runtime.GOOS == "windows" {
-		cli.SetIn(streams.NewIn(os.Stdin))
+		// TODO(thaJeztah); change to io.Reader and skip wrapping once prompt.DisableInputEcho no longer requires a streams.In
+		stdIn = streams.NewIn(os.Stdin)
 	}
 
-	// Some links documenting this:
-	// - https://code.google.com/archive/p/mintty/issues/56
-	// - https://github.com/docker/docker/issues/15272
-	// - https://mintty.github.io/ (compatibility)
-	// Linux will hit this if you attempt `cat | docker login`, and Windows
-	// will hit this if you attempt docker login from mintty where stdin
-	// is a pipe, not a character based console.
-	if flPassword == "" && !cli.In().IsTerminal() {
-		return errors.Errorf("Error: Cannot perform an interactive login from a non TTY device")
-	}
-
-	authconfig.Username = strings.TrimSpace(authconfig.Username)
-
-	if flUser = strings.TrimSpace(flUser); flUser == "" {
-		if isDefaultRegistry {
-			// if this is a default registry (docker hub), then display the following message.
-			fmt.Fprintln(cli.Out(), "Login with your Docker ID to push and pull images from Docker Hub. If you don't have a Docker ID, head over to https://hub.docker.com to create one.")
+	argUser = strings.TrimSpace(argUser)
+	if argUser == "" {
+		if serverAddress == authConfigKey {
+			// When signing in to the default (Docker Hub) registry, we display
+			// hints for creating an account, and (if hints are enabled), using
+			// a token instead of a password.
+			_, _ = fmt.Fprintln(cli.Out(), registerSuggest)
+			if hints.Enabled() {
+				_, _ = fmt.Fprintln(cli.Out(), patSuggest)
+				_, _ = fmt.Fprintln(cli.Out())
+			}
 		}
-		promptWithDefault(cli.Out(), "Username", authconfig.Username)
-		flUser = readInput(cli.In(), cli.Out())
-		flUser = strings.TrimSpace(flUser)
-		if flUser == "" {
-			flUser = authconfig.Username
+
+		var msg string
+		defaultUsername = strings.TrimSpace(defaultUsername)
+		if defaultUsername == "" {
+			msg = "Username: "
+		} else {
+			msg = fmt.Sprintf("Username (%s): ", defaultUsername)
 		}
-	}
-	if flUser == "" {
-		return errors.Errorf("Error: Non-null Username Required")
-	}
-	if flPassword == "" {
-		oldState, err := term.SaveState(cli.In().FD())
+
+		var err error
+		argUser, err = prompt.ReadInput(ctx, stdIn, cli.Out(), msg)
 		if err != nil {
-			return err
+			return registrytypes.AuthConfig{}, err
 		}
-		fmt.Fprintf(cli.Out(), "Password: ")
-		term.DisableEcho(cli.In().FD(), oldState)
-
-		flPassword = readInput(cli.In(), cli.Out())
-		fmt.Fprint(cli.Out(), "\n")
-
-		term.RestoreTerminal(cli.In().FD(), oldState)
-		if flPassword == "" {
-			return errors.Errorf("Error: Password Required")
+		if argUser == "" {
+			argUser = defaultUsername
+		}
+		if argUser == "" {
+			return registrytypes.AuthConfig{}, errors.New("error: username is required")
 		}
 	}
 
-	authconfig.Username = flUser
-	authconfig.Password = flPassword
+	isEmpty := strings.TrimSpace(argPassword) == ""
+	if isEmpty {
+		restoreInput, err := prompt.DisableInputEcho(stdIn)
+		if err != nil {
+			return registrytypes.AuthConfig{}, err
+		}
+		defer func() {
+			if err := restoreInput(); err != nil {
+				// TODO(thaJeztah): we should consider printing instructions how
+				//  to restore this manually (other than restarting the shell).
+				//  e.g., 'run stty echo' when in a Linux or macOS shell, but
+				//  PowerShell and CMD.exe may need different instructions.
+				_, _ = fmt.Fprintln(cli.Err(), "Error: failed to restore terminal state to echo input:", err)
+			}
+		}()
 
-	return nil
+		if serverAddress == authConfigKey {
+			out := tui.NewOutput(cli.Err())
+			out.PrintNote("A Personal Access Token (PAT) can be used instead.\n" +
+				"To create a PAT, visit " + aec.Underline.Apply("https://app.docker.com/settings") + "\n\n")
+		}
+
+		argPassword, err = prompt.ReadInput(ctx, stdIn, cli.Out(), "Password: ")
+		if err != nil {
+			return registrytypes.AuthConfig{}, err
+		}
+		_, _ = fmt.Fprintln(cli.Out())
+		if argPassword == "" {
+			return registrytypes.AuthConfig{}, errors.New("error: password is required")
+		}
+	}
+
+	return registrytypes.AuthConfig{
+		Username:      argUser,
+		Password:      argPassword,
+		ServerAddress: serverAddress,
+	}, nil
 }
 
-func readInput(in io.Reader, out io.Writer) string {
-	reader := bufio.NewReader(in)
-	line, _, err := reader.ReadLine()
-	if err != nil {
-		fmt.Fprintln(out, err.Error())
-		os.Exit(1)
-	}
-	return string(line)
-}
-
-func promptWithDefault(out io.Writer, prompt string, configDefault string) {
-	if configDefault == "" {
-		fmt.Fprintf(out, "%s: ", prompt)
-	} else {
-		fmt.Fprintf(out, "%s (%s): ", prompt, configDefault)
-	}
-}
-
-// RetrieveAuthTokenFromImage retrieves an encoded auth token given a complete image
-func RetrieveAuthTokenFromImage(ctx context.Context, cli Cli, image string) (string, error) {
-	// Retrieve encoded auth token from the image reference
-	authConfig, err := resolveAuthConfigFromImage(ctx, cli, image)
-	if err != nil {
-		return "", err
-	}
-	encodedAuth, err := EncodeAuthToBase64(authConfig)
-	if err != nil {
-		return "", err
-	}
-	return encodedAuth, nil
-}
-
-// resolveAuthConfigFromImage retrieves that AuthConfig using the image string
-func resolveAuthConfigFromImage(ctx context.Context, cli Cli, image string) (types.AuthConfig, error) {
+// RetrieveAuthTokenFromImage retrieves an encoded auth token given a
+// complete image reference. The auth configuration is serialized as a
+// base64url encoded ([RFC 4648, Section 5]) JSON string for sending through
+// the "X-Registry-Auth" header.
+//
+// [RFC 4648, Section 5]: https://tools.ietf.org/html/rfc4648#section-5
+func RetrieveAuthTokenFromImage(cfg *configfile.ConfigFile, image string) (string, error) {
 	registryRef, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
-		return types.AuthConfig{}, err
+		return "", err
 	}
-	repoInfo, err := registry.ParseRepositoryInfo(registryRef)
+	authConfig, err := cfg.GetAuthConfig(reference.Domain(registryRef))
 	if err != nil {
-		return types.AuthConfig{}, err
+		return "", err
 	}
-	return ResolveAuthConfig(ctx, cli, repoInfo.Index), nil
+
+	return authconfig.Encode(registrytypes.AuthConfig{
+		Username:      authConfig.Username,
+		Password:      authConfig.Password,
+		ServerAddress: authConfig.ServerAddress,
+
+		// TODO(thaJeztah): Are these expected to be included?
+		Auth:          authConfig.Auth,
+		IdentityToken: authConfig.IdentityToken,
+		RegistryToken: authConfig.RegistryToken,
+	})
 }

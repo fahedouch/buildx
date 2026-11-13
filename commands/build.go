@@ -1,351 +1,1223 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/containerd/console"
+	"github.com/containerd/containerd/v2/pkg/epoch"
 	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/policy"
+	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
+	"github.com/docker/buildx/util/buildflags"
+	"github.com/docker/buildx/util/cobrautil"
+	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/desktop"
+	"github.com/docker/buildx/util/dockerutil"
+	"github.com/docker/buildx/util/dockerutil/dockerconfig"
+	"github.com/docker/buildx/util/ioset"
+	"github.com/docker/buildx/util/metricutil"
+	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
+	dockeropts "github.com/docker/cli/opts"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	"github.com/moby/buildkit/frontend/subrequests"
+	"github.com/moby/buildkit/frontend/subrequests/lint"
+	"github.com/moby/buildkit/frontend/subrequests/outline"
+	"github.com/moby/buildkit/frontend/subrequests/targets"
 	"github.com/moby/buildkit/session/auth/authprovider"
-	"github.com/moby/buildkit/util/appcontext"
+	"github.com/moby/buildkit/solver/errdefs"
+	solverpb "github.com/moby/buildkit/solver/pb"
+	sourcepolicy "github.com/moby/buildkit/sourcepolicy/pb"
+	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/moby/client/pkg/versions"
+	"github.com/moby/sys/atomicwriter"
+	"github.com/morikuni/aec"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
 )
 
 type buildOptions struct {
-	commonOptions
-	contextPath    string
-	dockerfileName string
-	tags           []string
-	labels         []string
+	allow          []string
+	annotations    []string
 	buildArgs      []string
+	cacheFrom      []string
+	cacheTo        []string
+	cgroupParent   string
+	contextPath    string
+	contexts       []string
+	dockerfileName string
+	extraHosts     []string
+	imageIDFile    string
+	labels         []string
+	networkMode    string
+	noCacheFilter  []string
+	outputs        []string
+	platforms      []string
+	policy         []string
+	callFunc       string
+	secrets        []string
+	shmSize        dockeropts.MemBytes
+	ssh            []string
+	tags           []string
+	target         string
+	ulimits        *dockeropts.UlimitOpt
 
-	cacheFrom   []string
-	cacheTo     []string
-	target      string
-	platforms   []string
-	secrets     []string
-	ssh         []string
-	outputs     []string
-	imageIDFile string
-	extraHosts  []string
-	networkMode string
+	resources []string
+	// legacyResources is kept separate from resources because the pflag
+	// StringArray for --resource resets its backing slice on first use.
+	legacyResources []string
 
-	// unimplemented
-	squash bool
-	quiet  bool
+	attests    []string
+	sbom       string
+	provenance string
 
-	allow []string
-
-	// hidden
-	// untrusted   bool
-	// ulimits        *opts.UlimitOpt
-	// memory         opts.MemBytes
-	// memorySwap     opts.MemSwapBytes
-	// shmSize        opts.MemBytes
-	// cpuShares      int64
-	// cpuPeriod      int64
-	// cpuQuota       int64
-	// cpuSetCpus     string
-	// cpuSetMems     string
-	// cgroupParent   string
-	// isolation      string
-	// compress    bool
-	// securityOpt []string
-}
-
-type commonOptions struct {
-	builder  string
-	noCache  *bool
 	progress string
-	pull     *bool
-	// golangci-lint#826
-	// nolint:structcheck
-	exportPush bool
-	// nolint:structcheck
-	exportLoad bool
+	quiet    bool
+
+	builder      string
+	metadataFile string
+	noCache      bool
+	pull         bool
+	exportPush   bool
+	exportLoad   bool
 }
 
-func runBuild(dockerCli command.Cli, in buildOptions) error {
-	if in.squash {
-		return errors.Errorf("squash currently not implemented")
-	}
-	if in.quiet {
-		logrus.Warnf("quiet currently not implemented")
-	}
+func (o *buildOptions) toOptions() (*BuildOptions, error) {
+	var err error
 
-	ctx := appcontext.Context()
-
-	noCache := false
-	if in.noCache != nil {
-		noCache = *in.noCache
-	}
-	pull := false
-	if in.pull != nil {
-		pull = *in.pull
-	}
-
-	opts := build.Options{
-		Inputs: build.Inputs{
-			ContextPath:    in.contextPath,
-			DockerfilePath: in.dockerfileName,
-			InStream:       os.Stdin,
-		},
-		Tags:        in.tags,
-		Labels:      listToMap(in.labels, false),
-		BuildArgs:   listToMap(in.buildArgs, true),
-		Pull:        pull,
-		NoCache:     noCache,
-		Target:      in.target,
-		ImageIDFile: in.imageIDFile,
-		ExtraHosts:  in.extraHosts,
-		NetworkMode: in.networkMode,
-	}
-
-	platforms, err := platformutil.Parse(in.platforms)
+	buildArgs, err := listToMap(o.buildArgs, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	opts.Platforms = platforms
 
-	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(os.Stderr))
-
-	secrets, err := build.ParseSecretSpecs(in.secrets)
+	labels, err := listToMap(o.labels, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	opts.Session = append(opts.Session, secrets)
 
-	ssh, err := build.ParseSSHSpecs(in.ssh)
-	if err != nil {
-		return err
+	opts := BuildOptions{
+		Allow:          o.allow,
+		Annotations:    o.annotations,
+		BuildArgs:      buildArgs,
+		CgroupParent:   o.cgroupParent,
+		ContextPath:    o.contextPath,
+		DockerfileName: o.dockerfileName,
+		ExtraHosts:     o.extraHosts,
+		Labels:         labels,
+		NetworkMode:    o.networkMode,
+		NoCacheFilter:  o.noCacheFilter,
+		Platforms:      o.platforms,
+		ShmSize:        int64(o.shmSize),
+		Tags:           o.tags,
+		Target:         o.target,
+		Ulimits:        o.ulimits,
+		Resources:      append(o.legacyResources, o.resources...),
+		Builder:        o.builder,
+		NoCache:        o.noCache,
+		Pull:           o.pull,
+		ExportPush:     o.exportPush,
+		ExportLoad:     o.exportLoad,
 	}
-	opts.Session = append(opts.Session, ssh)
 
-	outputs, err := build.ParseOutputs(in.outputs)
-	if err != nil {
-		return err
-	}
-	if in.exportPush {
-		if in.exportLoad {
-			return errors.Errorf("push and load may not be set together at the moment")
+	if _, ok := opts.BuildArgs[epoch.SourceDateEpochEnv]; !ok {
+		if v := os.Getenv(epoch.SourceDateEpochEnv); v != "" {
+			opts.BuildArgs[epoch.SourceDateEpochEnv] = v
 		}
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type: "image",
-				Attrs: map[string]string{
-					"push": "true",
-				},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "image":
-				outputs[0].Attrs["push"] = "true"
-			default:
-				return errors.Errorf("push and %q output can't be used together", outputs[0].Type)
+	}
+
+	opts.SourcePolicy, err = build.ReadSourcePolicy()
+	if err != nil {
+		return nil, err
+	}
+
+	opts.Policy, err = buildflags.ParsePolicyConfigs(o.policy)
+	if err != nil {
+		return nil, err
+	}
+
+	inAttests := slices.Clone(o.attests)
+	if o.provenance != "" {
+		inAttests = append(inAttests, buildflags.CanonicalizeAttest("provenance", o.provenance))
+	}
+	if o.sbom != "" {
+		inAttests = append(inAttests, buildflags.CanonicalizeAttest("sbom", o.sbom))
+	}
+	opts.Attests, err = buildflags.ParseAttests(inAttests)
+	if err != nil {
+		return nil, err
+	}
+
+	opts.NamedContexts, err = buildflags.ParseContextNames(o.contexts)
+	if err != nil {
+		return nil, err
+	}
+
+	opts.Exports, err = buildflags.ParseExports(o.outputs)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range opts.Exports {
+		if (e.Type == client.ExporterLocal || e.Type == client.ExporterTar) && o.imageIDFile != "" {
+			return nil, errors.Errorf("local and tar exporters are incompatible with image ID file")
+		}
+	}
+
+	opts.CacheFrom, err = buildflags.ParseCacheEntry(o.cacheFrom)
+	if err != nil {
+		return nil, err
+	}
+
+	opts.CacheTo, err = buildflags.ParseCacheEntry(o.cacheTo)
+	if err != nil {
+		return nil, err
+	}
+
+	opts.Secrets, err = buildflags.ParseSecretSpecs(o.secrets)
+	if err != nil {
+		return nil, err
+	}
+	opts.SSH, err = buildflags.ParseSSHSpecs(o.ssh)
+	if err != nil {
+		return nil, err
+	}
+
+	opts.CallFunc, err = buildflags.ParseCallFunc(o.callFunc)
+	if err != nil {
+		return nil, err
+	}
+
+	prm := confutil.MetadataProvenance()
+	if opts.CallFunc != nil || len(o.metadataFile) == 0 {
+		prm = confutil.MetadataProvenanceModeDisabled
+	}
+	opts.ProvenanceResponseMode = string(prm)
+
+	return &opts, nil
+}
+
+func (o *buildOptions) toDisplayMode() (progressui.DisplayMode, error) {
+	progressMode := o.progress
+	if progressMode == "quiet" {
+		o.quiet = true
+	}
+	if progressMode == "none" { // in buildx "quiet" means printing image ID in the end
+		progressMode = "quiet"
+	}
+	progress := progressui.DisplayMode(progressMode)
+	if o.quiet {
+		if progress != progressui.AutoMode && progress != progressui.QuietMode {
+			return "", errors.Errorf("progress=%s and quiet cannot be used together", o.progress)
+		}
+		return progressui.QuietMode, nil
+	}
+	return progress, nil
+}
+
+// legacyResourceValue is a pflag.Value that appends a "<key>=value" entry to
+// the --resource list, wiring the hidden legacy flags into the same code path.
+type legacyResourceValue struct {
+	key       string
+	resources *[]string
+}
+
+func (v *legacyResourceValue) String() string { return "" }
+func (v *legacyResourceValue) Type() string   { return "string" }
+func (v *legacyResourceValue) Set(s string) error {
+	*v.resources = append(*v.resources, v.key+"="+s)
+	return nil
+}
+
+const (
+	commandNameAttribute = attribute.Key("command.name")
+	commandOptionsHash   = attribute.Key("command.options.hash")
+	driverNameAttribute  = attribute.Key("driver.name")
+	driverTypeAttribute  = attribute.Key("driver.type")
+	debuggerName         = attribute.Key("debugger.name")
+	debuggerUserAgent    = attribute.Key("debugger.user.agent")
+)
+
+func buildMetricAttributes(dockerCli command.Cli, driverType string, options *buildOptions, debugger debuggerOptions) attribute.Set {
+	kvs := []attribute.KeyValue{
+		commandNameAttribute.String("build"),
+		attribute.Stringer(string(commandOptionsHash), &buildOptionsHash{
+			buildOptions: options,
+			cfg:          confutil.NewConfig(dockerCli),
+		}),
+		driverNameAttribute.String(options.builder),
+		driverTypeAttribute.String(driverType),
+	}
+
+	if debugger != nil {
+		d := debugger.Info()
+		kvs = append(kvs,
+			debuggerName.String(d.Name),
+			debuggerUserAgent.String(d.UserAgent),
+		)
+	}
+	return attribute.NewSet(kvs...)
+}
+
+// buildOptionsHash computes a hash for the buildOptions when the String method is invoked.
+// This is done so we can delay the computation of the hash until needed by OTEL using
+// the fmt.Stringer interface.
+type buildOptionsHash struct {
+	*buildOptions
+	cfg        *confutil.Config
+	result     string
+	resultOnce sync.Once
+}
+
+func (o *buildOptionsHash) String() string {
+	o.resultOnce.Do(func() {
+		target := o.target
+		contextPath := o.contextPath
+		dockerfile := o.dockerfileName
+		if dockerfile == "" {
+			dockerfile = "Dockerfile"
+		}
+
+		if contextPath != "-" && osutil.IsLocalDir(contextPath) {
+			contextPath = osutil.ToAbs(contextPath)
+		}
+		salt := o.cfg.TryNodeIdentifier()
+
+		h := sha256.New()
+		for _, s := range []string{target, contextPath, dockerfile, salt} {
+			_, _ = io.WriteString(h, s)
+			h.Write([]byte{0})
+		}
+		o.result = hex.EncodeToString(h.Sum(nil))
+	})
+	return o.result
+}
+
+func runBuild(ctx context.Context, dockerCli command.Cli, debugOpts debuggerOptions, options buildOptions) (err error) {
+	mp := dockerCli.MeterProvider()
+
+	ctx, end, err := tracing.TraceCurrentCommand(ctx, []string{"build", options.contextPath},
+		attribute.String("builder", options.builder),
+		attribute.String("context", options.contextPath),
+		attribute.String("dockerfile", options.dockerfileName),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		end(err)
+	}()
+
+	opts, err := options.toOptions()
+	if err != nil {
+		return err
+	}
+
+	// Avoid leaving a stale file if we eventually fail
+	if options.imageIDFile != "" {
+		if err := os.Remove(options.imageIDFile); err != nil && !os.IsNotExist(err) {
+			return errors.Wrap(err, "removing image ID file")
+		}
+	}
+
+	contextPathHash := options.contextPath
+	if absContextPath, err := filepath.Abs(contextPathHash); err == nil {
+		contextPathHash = absContextPath
+	}
+	b, err := builder.New(dockerCli,
+		builder.WithName(options.builder),
+		builder.WithContextPathHash(contextPathHash),
+	)
+	if err != nil {
+		return err
+	}
+	imageVerifier := policy.DefaultImageVerifier(confutil.NewConfig(dockerCli))
+	_, err = b.LoadNodes(ctx, builder.WithImageVerifier(imageVerifier))
+	if err != nil {
+		return err
+	}
+	driverType := b.Driver
+
+	attributes := buildMetricAttributes(dockerCli, driverType, &options, debugOpts)
+
+	ctx2, cancel := context.WithCancelCause(context.TODO())
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
+	progressMode, err := options.toDisplayMode()
+	if err != nil {
+		return err
+	}
+
+	var (
+		out io.Writer = os.Stderr
+		dbg debuggerInstance
+	)
+
+	if debugOpts != nil {
+		if options.dockerfileName == "-" || options.contextPath == "-" {
+			// stdin must be usable for debugger
+			return errors.Errorf("Dockerfile or context from stdin is not supported with debugger")
+		}
+
+		dbg, err = debugOpts.New(ioset.In{
+			Stdin:  io.NopCloser(dockerCli.In()),
+			Stdout: nopCloser{dockerCli.Out()},
+			Stderr: nopCloser{dockerCli.Err()},
+		})
+		if err != nil {
+			return err
+		}
+		out = dbg.Out()
+	}
+
+	var term bool
+	if c, ok := out.(console.File); ok {
+		if _, err := console.ConsoleFromFile(c); err == nil {
+			term = true
+		}
+	}
+
+	var printer *progress.Printer
+	printer, err = progress.NewPrinter(ctx2, out, progressMode,
+		progress.WithDesc(
+			fmt.Sprintf("building with %q instance using %s driver", b.Name, b.Driver),
+			fmt.Sprintf("%s:%s", b.Driver, b.Name),
+		),
+		progress.WithMetrics(mp, attributes),
+		progress.WithOnClose(func() {
+			printWarnings(os.Stderr, printer.Warnings(), progressMode)
+		}),
+	)
+	if err != nil {
+		return err
+	}
+
+	done := timeBuildCommand(mp, attributes)
+	resp, inputs, retErr := runBuildWithOptions(ctx, dockerCli, opts, dbg, printer)
+
+	done(retErr)
+	if retErr != nil {
+		return retErr
+	}
+
+	switch progressMode {
+	case progressui.RawJSONMode:
+		// no additional display
+	case progressui.QuietMode:
+		if options.quiet && opts.CallFunc == nil {
+			fmt.Println(getImageID(resp.ExporterResponse))
+		}
+	default:
+		desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
+	}
+	if options.imageIDFile != "" {
+		if err := os.WriteFile(options.imageIDFile, []byte(getImageID(resp.ExporterResponse)), 0o644); err != nil {
+			return errors.Wrap(err, "writing image ID file")
+		}
+	}
+	if options.metadataFile != "" {
+		dt := decodeExporterResponse(resp.ExporterResponse)
+		if opts.CallFunc == nil {
+			if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
+				dt["buildx.build.warnings"] = warnings
 			}
 		}
-	}
-	if in.exportLoad {
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type:  "docker",
-				Attrs: map[string]string{},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "docker":
-			default:
-				return errors.Errorf("load and %q output can't be used together", outputs[0].Type)
-			}
+		if err := writeMetadataFile(options.metadataFile, dt); err != nil {
+			return err
 		}
 	}
-
-	opts.Exports = outputs
-
-	cacheImports, err := build.ParseCacheEntry(in.cacheFrom)
-	if err != nil {
-		return err
+	if opts.CallFunc != nil {
+		if exitCode, err := printResult(dockerCli.Out(), opts.CallFunc, resp.ExporterResponse, options.target, inputs); err != nil {
+			return err
+		} else if exitCode != 0 {
+			return cobrautil.ExitCodeError(exitCode)
+		}
 	}
-	opts.CacheFrom = cacheImports
-
-	cacheExports, err := build.ParseCacheEntry(in.cacheTo)
-	if err != nil {
-		return err
+	if v, ok := resp.ExporterResponse["frontend.result.inlinemessage"]; ok {
+		fmt.Fprintf(dockerCli.Out(), "\n%s\n", v)
+		return nil
 	}
-	opts.CacheTo = cacheExports
-
-	allow, err := build.ParseEntitlements(in.allow)
-	if err != nil {
-		return err
-	}
-	opts.Allow = allow
-
-	// key string used for kubernetes "sticky" mode
-	contextPathHash, err := filepath.Abs(in.contextPath)
-	if err != nil {
-		contextPathHash = in.contextPath
-	}
-
-	return buildTargets(ctx, dockerCli, map[string]build.Options{"default": opts}, in.progress, contextPathHash, in.builder)
+	return nil
 }
 
-func buildTargets(ctx context.Context, dockerCli command.Cli, opts map[string]build.Options, progressMode, contextPathHash, instance string) error {
-	dis, err := getInstanceOrDefault(ctx, dockerCli, instance, contextPathHash)
-	if err != nil {
-		return err
+// getImageID returns the image identifier selected for the export destination.
+func getImageID(resp map[string]string) string {
+	dgst := resp[exptypes.ExporterImageDigestKey]
+	if v, ok := resp[exptypes.ExporterImageConfigDigestKey]; ok {
+		dgst = v
 	}
-
-	ctx2, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-	printer := progress.NewPrinter(ctx2, os.Stderr, progressMode)
-
-	_, err = build.Build(ctx, dis, opts, dockerAPI(dockerCli), dockerCli.ConfigFile(), printer)
-	err1 := printer.Wait()
-	if err == nil {
-		err = err1
-	}
-
-	return err
+	return dgst
 }
 
-func buildCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
-	var options buildOptions
+func runBuildWithOptions(ctx context.Context, dockerCli command.Cli, opts *BuildOptions, dbg debuggerInstance, printer *progress.Printer) (_ *client.SolveResponse, _ *build.Inputs, retErr error) {
+	var bh build.Handler
+	if dbg != nil {
+		if err := dbg.Start(printer, opts); err != nil {
+			return nil, nil, err
+		}
+		defer func() { dbg.Stop(retErr) }()
+
+		bh = dbg.Handler()
+		dockerCli.SetIn(nil)
+	}
+
+	// Ensure messages sent to the printer are flushed before the debugger completes.
+	// This prevents late messages from not being sent because the connection was
+	// terminated before completion of the debugger.
+	defer func() {
+		if err := printer.Wait(); retErr == nil {
+			retErr = err
+		}
+	}()
+
+	in := dockerCli.In()
+	for {
+		resp, inputs, err := RunBuild(ctx, dockerCli, opts, in, printer, &bh)
+		if err != nil {
+			if errors.Is(err, build.ErrRestart) {
+				retErr = nil
+				continue
+			}
+			return nil, nil, errors.Wrapf(err, "failed to build")
+		}
+
+		return resp, inputs, err
+	}
+}
+
+func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugger debuggerOptions) *cobra.Command {
+	cFlags := &commonFlags{}
+	options := &buildOptions{}
 
 	cmd := &cobra.Command{
 		Use:     "build [OPTIONS] PATH | URL | -",
-		Aliases: []string{"b"},
 		Short:   "Start a build",
 		Args:    cli.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			options.contextPath = args[0]
-			options.builder = rootOpts.builder
-			return runBuild(dockerCli, options)
+		Aliases: []string{"b"},
+		Annotations: map[string]string{
+			"aliases": "docker build, docker builder build, docker image build, docker buildx b",
 		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				options.contextPath = args[0]
+			}
+			options.builder = rootOpts.builder
+			options.metadataFile = cFlags.metadataFile
+			options.noCache = false
+			if cFlags.noCache != nil {
+				options.noCache = *cFlags.noCache
+			}
+			options.pull = false
+			if cFlags.pull != nil {
+				options.pull = *cFlags.pull
+			}
+			options.progress = cFlags.progress
+			cmd.Flags().VisitAll(checkWarnedFlags)
+
+			return runBuild(cmd.Context(), dockerCli, debugger, *options)
+		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			return nil, cobra.ShellCompDirectiveFilterDirs
+		},
+		DisableFlagsInUseLine: true,
+	}
+
+	var platformsDefault []string
+	if v := os.Getenv("DOCKER_DEFAULT_PLATFORM"); v != "" {
+		platformsDefault = []string{v}
 	}
 
 	flags := cmd.Flags()
 
-	flags.BoolVar(&options.exportPush, "push", false, "Shorthand for --output=type=registry")
-	flags.BoolVar(&options.exportLoad, "load", false, "Shorthand for --output=type=docker")
+	flags.StringSliceVar(&options.extraHosts, "add-host", []string{}, `Add a custom host-to-IP mapping (format: "host:ip")`)
 
-	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, "Name and optionally a tag in the 'name:tag' format")
-	flags.SetAnnotation("tag", "docs.external.url", []string{"https://docs.docker.com/engine/reference/commandline/build/#tag-an-image--t"})
+	flags.StringArrayVar(&options.allow, "allow", []string{}, `Allow extra privileged entitlement (e.g., "network.host", "security.insecure", "device", "buildx.local.delete")`)
+
+	flags.StringArrayVarP(&options.annotations, "annotation", "", []string{}, "Add annotation to the image")
+
 	flags.StringArrayVar(&options.buildArgs, "build-arg", []string{}, "Set build-time variables")
-	flags.SetAnnotation("build-arg", "docs.external.url", []string{"https://docs.docker.com/engine/reference/commandline/build/#set-build-time-variables---build-arg"})
 
-	flags.StringVarP(&options.dockerfileName, "file", "f", "", "Name of the Dockerfile (Default is 'PATH/Dockerfile')")
-	flags.SetAnnotation("file", "docs.external.url", []string{"https://docs.docker.com/engine/reference/commandline/build/#specify-a-dockerfile--f"})
+	flags.StringArrayVar(&options.cacheFrom, "cache-from", []string{}, `External cache sources (e.g., "user/app:cache", "type=local,src=path/to/dir")`)
+
+	flags.StringArrayVar(&options.cacheTo, "cache-to", []string{}, `Cache export destinations (e.g., "user/app:cache", "type=local,dest=path/to/dir")`)
+
+	flags.StringVar(&options.cgroupParent, "cgroup-parent", "", `Set the parent cgroup for the "RUN" instructions during build`)
+
+	flags.StringArrayVar(&options.contexts, "build-context", []string{}, "Additional build contexts (e.g., name=path)")
+
+	flags.StringVarP(&options.dockerfileName, "file", "f", "", `Name of the Dockerfile (default: "PATH/Dockerfile")`)
+
+	flags.StringVar(&options.imageIDFile, "iidfile", "", "Write the image ID to a file")
 
 	flags.StringArrayVar(&options.labels, "label", []string{}, "Set metadata for an image")
 
-	flags.StringArrayVar(&options.cacheFrom, "cache-from", []string{}, "External cache sources (eg. user/app:cache, type=local,src=path/to/dir)")
-	flags.StringArrayVar(&options.cacheTo, "cache-to", []string{}, "Cache export destinations (eg. user/app:cache, type=local,dest=path/to/dir)")
+	flags.BoolVar(&options.exportLoad, "load", false, `Shorthand for "--output=type=docker"`)
 
-	flags.StringVar(&options.target, "target", "", "Set the target build stage to build.")
-	flags.SetAnnotation("target", "docs.external.url", []string{"https://docs.docker.com/engine/reference/commandline/build/#specifying-target-build-stage---target"})
+	flags.StringVar(&options.networkMode, "network", "default", `Set the networking mode for the "RUN" instructions during build`)
 
-	flags.StringSliceVar(&options.allow, "allow", []string{}, "Allow extra privileged entitlement, e.g. network.host, security.insecure")
+	flags.StringArrayVar(&options.noCacheFilter, "no-cache-filter", []string{}, "Do not cache specified stages")
 
-	// not implemented
+	flags.StringArrayVarP(&options.outputs, "output", "o", []string{}, `Output destination (format: "type=local,dest=path")`)
+
+	flags.StringArrayVar(&options.platforms, "platform", platformsDefault, "Set target platform for build")
+
+	flags.StringArrayVar(&options.policy, "policy", []string{}, `Policy configuration (format: "filename=path[,filename=path][,reset=true|false][,disabled=true|false][,strict=true|false][,log-level=level]")`)
+
+	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--output=type=registry,unpack=false"`)
+
 	flags.BoolVarP(&options.quiet, "quiet", "q", false, "Suppress the build output and print image ID on success")
-	flags.StringVar(&options.networkMode, "network", "default", "Set the networking mode for the RUN instructions during build")
-	flags.StringSliceVar(&options.extraHosts, "add-host", []string{}, "Add a custom host-to-IP mapping (host:ip)")
-	flags.SetAnnotation("add-host", "docs.external.url", []string{"https://docs.docker.com/engine/reference/commandline/build/#add-entries-to-container-hosts-file---add-host"})
-	flags.StringVar(&options.imageIDFile, "iidfile", "", "Write the image ID to the file")
-	flags.BoolVar(&options.squash, "squash", false, "Squash newly built layers into a single new layer")
-	flags.MarkHidden("quiet")
-	flags.MarkHidden("squash")
+
+	flags.StringArrayVar(&options.secrets, "secret", []string{}, `Secret to expose to the build (format: "id=mysecret[,src=/local/secret]")`)
+
+	flags.Var(&options.shmSize, "shm-size", `Shared memory size for build containers`)
+
+	flags.StringArrayVar(&options.ssh, "ssh", []string{}, `SSH agent socket or keys to expose to the build (format: "default|<id>[=<socket>|<key>[,<key>]]")`)
+
+	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, `Image identifier (format: "[registry/]repository[:tag]")`)
+
+	flags.StringVar(&options.target, "target", "", "Set the target build stage to build")
+
+	options.ulimits = dockeropts.NewUlimitOpt(nil)
+	flags.Var(options.ulimits, "ulimit", "Ulimit options")
+
+	flags.StringArrayVar(&options.resources, "resource", []string{}, `Resource limits for build containers (format: "memory=2g", "cpu-quota=50000")`)
+
+	flags.StringArrayVar(&options.attests, "attest", []string{}, `Attestation parameters (format: "type=sbom,generator=image")`)
+	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--attest=type=sbom"`)
+	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--attest=type=provenance"`)
+
+	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
+	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
+	flags.Lookup("check").NoOptDefVal = "true"
 
 	// hidden flags
 	var ignore string
 	var ignoreSlice []string
 	var ignoreBool bool
-	var ignoreInt int64
-	flags.StringVar(&ignore, "ulimit", "", "Ulimit options")
-	flags.MarkHidden("ulimit")
-	flags.StringSliceVar(&ignoreSlice, "security-opt", []string{}, "Security options")
-	flags.MarkHidden("security-opt")
+
+	flags.StringVar(&options.callFunc, "print", "", "Print result of information request (e.g., outline, targets)")
+	cobrautil.MarkFlagsExperimental(flags, "print")
+	flags.MarkHidden("print")
+
+	// Legacy per-resource flags, hidden and superseded by --resource.
+	flags.VarP(&legacyResourceValue{key: "memory", resources: &options.legacyResources}, "memory", "m", "Memory limit")
+	flags.MarkHidden("memory")
+
+	flags.VarP(&legacyResourceValue{key: "memory-swap", resources: &options.legacyResources}, "memory-swap", "", `Swap limit equal to memory plus swap: "-1" to enable unlimited swap`)
+	flags.MarkHidden("memory-swap")
+
+	flags.VarP(&legacyResourceValue{key: "cpu-shares", resources: &options.legacyResources}, "cpu-shares", "c", "CPU shares (relative weight)")
+	flags.MarkHidden("cpu-shares")
+
+	flags.VarP(&legacyResourceValue{key: "cpu-period", resources: &options.legacyResources}, "cpu-period", "", "Limit the CPU CFS (Completely Fair Scheduler) period")
+	flags.MarkHidden("cpu-period")
+
+	flags.VarP(&legacyResourceValue{key: "cpu-quota", resources: &options.legacyResources}, "cpu-quota", "", "Limit the CPU CFS (Completely Fair Scheduler) quota")
+	flags.MarkHidden("cpu-quota")
+
+	flags.VarP(&legacyResourceValue{key: "cpuset-cpus", resources: &options.legacyResources}, "cpuset-cpus", "", `CPUs in which to allow execution ("0-3", "0,1")`)
+	flags.MarkHidden("cpuset-cpus")
+
+	flags.VarP(&legacyResourceValue{key: "cpuset-mems", resources: &options.legacyResources}, "cpuset-mems", "", `MEMs in which to allow execution ("0-3", "0,1")`)
+	flags.MarkHidden("cpuset-mems")
+
 	flags.BoolVar(&ignoreBool, "compress", false, "Compress the build context using gzip")
 	flags.MarkHidden("compress")
-	flags.StringVarP(&ignore, "memory", "m", "", "Memory limit")
-	flags.MarkHidden("memory")
-	flags.StringVar(&ignore, "memory-swap", "", "Swap limit equal to memory plus swap: '-1' to enable unlimited swap")
-	flags.MarkHidden("memory-swap")
-	flags.StringVar(&ignore, "shm-size", "", "Size of /dev/shm")
-	flags.MarkHidden("shm-size")
-	flags.Int64VarP(&ignoreInt, "cpu-shares", "c", 0, "CPU shares (relative weight)")
-	flags.MarkHidden("cpu-shares")
-	flags.Int64Var(&ignoreInt, "cpu-period", 0, "Limit the CPU CFS (Completely Fair Scheduler) period")
-	flags.MarkHidden("cpu-period")
-	flags.Int64Var(&ignoreInt, "cpu-quota", 0, "Limit the CPU CFS (Completely Fair Scheduler) quota")
-	flags.MarkHidden("cpu-quota")
-	flags.StringVar(&ignore, "cpuset-cpus", "", "CPUs in which to allow execution (0-3, 0,1)")
-	flags.MarkHidden("cpuset-cpus")
-	flags.StringVar(&ignore, "cpuset-mems", "", "MEMs in which to allow execution (0-3, 0,1)")
-	flags.MarkHidden("cpuset-mems")
-	flags.StringVar(&ignore, "cgroup-parent", "", "Optional parent cgroup for the container")
-	flags.MarkHidden("cgroup-parent")
+
 	flags.StringVar(&ignore, "isolation", "", "Container isolation technology")
 	flags.MarkHidden("isolation")
+	flags.SetAnnotation("isolation", "flag-warn", []string{"isolation flag is deprecated with BuildKit."})
+
+	flags.StringSliceVar(&ignoreSlice, "security-opt", []string{}, "Security options")
+	flags.MarkHidden("security-opt")
+	flags.SetAnnotation("security-opt", "flag-warn", []string{`security-opt flag is deprecated. "RUN --security=insecure" should be used with BuildKit.`})
+
+	flags.BoolVar(&ignoreBool, "squash", false, "Squash newly built layers into a single new layer")
+	flags.MarkHidden("squash")
+	flags.SetAnnotation("squash", "flag-warn", []string{"experimental flag squash is removed with BuildKit. You should squash inside build using a multi-stage Dockerfile for efficiency."})
+	cobrautil.MarkFlagsExperimental(flags, "squash")
+
 	flags.BoolVar(&ignoreBool, "rm", true, "Remove intermediate containers after a successful build")
 	flags.MarkHidden("rm")
+
 	flags.BoolVar(&ignoreBool, "force-rm", false, "Always remove intermediate containers")
 	flags.MarkHidden("force-rm")
 
-	platformsDefault := []string{}
-	if v := os.Getenv("DOCKER_DEFAULT_PLATFORM"); v != "" {
-		platformsDefault = []string{v}
-	}
-	flags.StringArrayVar(&options.platforms, "platform", platformsDefault, "Set target platform for build")
-
-	flags.StringArrayVar(&options.secrets, "secret", []string{}, "Secret file to expose to the build: id=mysecret,src=/local/secret")
-
-	flags.StringArrayVar(&options.ssh, "ssh", []string{}, "SSH agent socket or keys to expose to the build (format: default|<id>[=<socket>|<key>[,<key>]])")
-
-	flags.StringArrayVarP(&options.outputs, "output", "o", []string{}, "Output destination (format: type=local,dest=path)")
-
-	commonBuildFlags(&options.commonOptions, flags)
-
+	commonBuildFlags(cFlags, flags)
 	return cmd
 }
 
-func commonBuildFlags(options *commonOptions, flags *pflag.FlagSet) {
-	options.noCache = flags.Bool("no-cache", false, "Do not use cache when building the image")
-
-	defaultProgress, ok := os.LookupEnv("BUILDX_PROGRESS_DEFAULT")
-	if !ok {
-		defaultProgress = "auto"
-	}
-	flags.StringVar(&options.progress, "progress", defaultProgress, "Set type of progress output (auto, plain, tty). Use plain to show container output")
-
-	options.pull = flags.Bool("pull", false, "Always attempt to pull a newer version of the image")
+// comomnFlags is a set of flags commonly shared among subcommands.
+type commonFlags struct {
+	metadataFile string
+	progress     string
+	noCache      *bool
+	pull         *bool
 }
 
-func listToMap(values []string, defaultEnv bool) map[string]string {
-	result := make(map[string]string, len(values))
-	for _, value := range values {
-		kv := strings.SplitN(value, "=", 2)
-		if len(kv) == 1 {
-			if defaultEnv {
-				v, ok := os.LookupEnv(kv[0])
-				if ok {
-					result[kv[0]] = v
-				}
-			} else {
-				result[kv[0]] = ""
-			}
-		} else {
-			result[kv[0]] = kv[1]
+func commonBuildFlags(options *commonFlags, flags *pflag.FlagSet) {
+	options.noCache = flags.Bool("no-cache", false, "Do not use cache when building the image")
+	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "none",  "plain", "quiet", "rawjson", "tty"). Use plain to show container output`)
+	options.pull = flags.Bool("pull", false, "Always attempt to pull all referenced images")
+	flags.StringVar(&options.metadataFile, "metadata-file", "", "Write build result metadata to a file")
+}
+
+func checkWarnedFlags(f *pflag.Flag) {
+	if !f.Changed {
+		return
+	}
+	for t, m := range f.Annotations {
+		switch t {
+		case "flag-warn":
+			logrus.Warn(m[0])
 		}
 	}
-	return result
+}
+
+func writeMetadataFile(filename string, dt any) error {
+	b, err := json.MarshalIndent(dt, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicwriter.WriteFile(filename, b, 0o644)
+}
+
+func decodeExporterResponse(exporterResponse map[string]string) map[string]any {
+	decFunc := func(k, v string) ([]byte, error) {
+		if k == "result.json" {
+			// result.json is part of metadata response for subrequests which
+			// is already a JSON object: https://github.com/moby/buildkit/blob/f6eb72f2f5db07ddab89ac5e2bd3939a6444f4be/frontend/dockerui/requests.go#L100-L102
+			return []byte(v), nil
+		}
+		return base64.StdEncoding.DecodeString(v)
+	}
+	out := make(map[string]any)
+	for k, v := range exporterResponse {
+		dt, err := decFunc(k, v)
+		if err != nil {
+			out[k] = v
+			continue
+		}
+		var raw map[string]any
+		if err = json.Unmarshal(dt, &raw); err != nil || len(raw) == 0 {
+			var rawList []map[string]any
+			if err = json.Unmarshal(dt, &rawList); err != nil || len(rawList) == 0 {
+				out[k] = v
+				continue
+			}
+		}
+		out[k] = json.RawMessage(dt)
+	}
+	return out
+}
+
+func wrapBuildError(err error, bake bool) error {
+	if err == nil {
+		return nil
+	}
+	st, ok := grpcerrors.AsGRPCStatus(err)
+	if ok {
+		if st.Code() == codes.Unimplemented && strings.Contains(st.Message(), "unsupported frontend capability moby.buildkit.frontend.contexts") {
+			msg := "current frontend does not support --build-context."
+			if bake {
+				msg = "current frontend does not support defining additional contexts for targets."
+			}
+			msg += " Named contexts are supported since Dockerfile v1.4. Use #syntax directive in Dockerfile or update to latest BuildKit."
+			return &wrapped{err, msg}
+		}
+		if st.Code() == codes.Unimplemented && strings.Contains(st.Message(), "unsupported frontend capability moby.buildkit.frontend.gitquerystring") {
+			msg := "current frontend does not support Git URLs with query string components."
+			msg += " Git URLs with query string are supported since Dockerfile v1.18 and BuildKit v0.24. Use BUILDKIT_SYNTAX build-arg, #syntax directive in Dockerfile or update to latest BuildKit."
+			return &wrapped{err, msg}
+		}
+	}
+	return err
+}
+
+type wrapped struct {
+	err error
+	msg string
+}
+
+func (w *wrapped) Error() string {
+	return w.msg
+}
+
+func (w *wrapped) Unwrap() error {
+	return w.err
+}
+
+func updateLastActivity(dockerCli command.Cli, ng *store.NodeGroup) error {
+	txn, release, err := storeutil.GetStore(dockerCli)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return txn.UpdateLastActivity(ng)
+}
+
+func listToMap(values []string, defaultEnv bool) (map[string]string, error) {
+	result := make(map[string]string, len(values))
+	for _, value := range values {
+		k, v, hasValue := strings.Cut(value, "=")
+		if k == "" {
+			return nil, errors.Errorf("invalid key-value pair %q: empty key", value)
+		}
+		if hasValue {
+			result[k] = v
+		} else if defaultEnv {
+			if envVal, ok := os.LookupEnv(k); ok {
+				result[k] = envVal
+			}
+		} else {
+			result[k] = ""
+		}
+	}
+	return result, nil
+}
+
+func printWarnings(w io.Writer, warnings []client.VertexWarning, mode progressui.DisplayMode) {
+	if len(warnings) == 0 || mode == progressui.QuietMode || mode == progressui.RawJSONMode {
+		return
+	}
+	fmt.Fprintf(w, "\n ")
+	sb := &bytes.Buffer{}
+	if len(warnings) == 1 {
+		fmt.Fprintf(sb, "1 warning found")
+	} else {
+		fmt.Fprintf(sb, "%d warnings found", len(warnings))
+	}
+	if logrus.GetLevel() < logrus.DebugLevel {
+		fmt.Fprintf(sb, " (use docker --debug to expand)")
+	}
+	fmt.Fprintf(sb, ":\n")
+	fmt.Fprint(w, aec.Apply(sb.String(), aec.YellowF))
+
+	for _, warn := range warnings {
+		fmt.Fprintf(w, " - %s\n", warn.Short)
+		if logrus.GetLevel() < logrus.DebugLevel {
+			continue
+		}
+		for _, d := range warn.Detail {
+			fmt.Fprintf(w, "%s\n", d)
+		}
+		if warn.URL != "" {
+			fmt.Fprintf(w, "More info: %s\n", warn.URL)
+		}
+		if warn.SourceInfo != nil && warn.Range != nil {
+			src := errdefs.Source{
+				Info:   warn.SourceInfo,
+				Ranges: warn.Range,
+			}
+			src.Print(w)
+		}
+		fmt.Fprintf(w, "\n")
+	}
+}
+
+func printResult(w io.Writer, f *buildflags.CallFunc, res map[string]string, target string, inp *build.Inputs) (int, error) {
+	switch f.Name {
+	case "outline":
+		return 0, printValue(w, outline.PrintOutline, outline.SubrequestsOutlineDefinition.Version, f.Format, res)
+	case "targets":
+		return 0, printValue(w, targets.PrintTargets, targets.SubrequestsTargetsDefinition.Version, f.Format, res)
+	case "subrequests.describe":
+		return 0, printValue(w, subrequests.PrintDescribe, subrequests.SubrequestsDescribeDefinition.Version, f.Format, res)
+	case "lint":
+		lintResults := lint.LintResults{}
+		if result, ok := res["result.json"]; ok {
+			if err := json.Unmarshal([]byte(result), &lintResults); err != nil {
+				return 0, err
+			}
+		}
+
+		warningCount := len(lintResults.Warnings)
+		if f.Format != "json" && warningCount > 0 {
+			var warningCountMsg string
+			if warningCount == 1 {
+				warningCountMsg = "1 warning has been found!"
+			} else if warningCount > 1 {
+				warningCountMsg = fmt.Sprintf("%d warnings have been found!", warningCount)
+			}
+			fmt.Fprintf(w, "Check complete, %s\n", warningCountMsg)
+		}
+		sourceInfoMap := func(sourceInfo *solverpb.SourceInfo) *solverpb.SourceInfo {
+			if sourceInfo == nil || inp == nil {
+				return sourceInfo
+			}
+			if target == "" {
+				target = "default"
+			}
+
+			if inp.DockerfileMappingSrc != "" {
+				newSourceInfo := proto.Clone(sourceInfo).(*solverpb.SourceInfo)
+				newSourceInfo.Filename = inp.DockerfileMappingSrc
+				return newSourceInfo
+			}
+			return sourceInfo
+		}
+
+		printLintWarnings := func(dt []byte, w io.Writer) error {
+			return lintResults.PrintTo(w, sourceInfoMap)
+		}
+
+		err := printValue(w, printLintWarnings, lint.SubrequestLintDefinition.Version, f.Format, res)
+		if err != nil {
+			return 0, err
+		}
+
+		if lintResults.Error != nil {
+			// Print the error message and the source
+			// Normally, we would use `errdefs.WithSource` to attach the source to the
+			// error and let the error be printed by the handling that's already in place,
+			// but here we want to print the error in a way that's consistent with how
+			// the lint warnings are printed via the `lint.PrintLintViolations` function,
+			// which differs from the default error printing.
+			if f.Format != "json" && len(lintResults.Warnings) > 0 {
+				fmt.Fprintln(w)
+			}
+			lintBuf := bytes.NewBuffer(nil)
+			lintResults.PrintErrorTo(lintBuf, sourceInfoMap)
+			return 0, errors.New(lintBuf.String())
+		} else if len(lintResults.Warnings) == 0 && f.Format != "json" {
+			fmt.Fprintln(w, "Check complete, no warnings found.")
+		}
+	default:
+		if dt, ok := res["result.json"]; ok && f.Format == "json" {
+			fmt.Fprintln(w, dt)
+		} else if dt, ok := res["result.txt"]; ok {
+			fmt.Fprint(w, dt)
+		} else {
+			fmt.Fprintf(w, "%s %+v\n", f, res)
+		}
+	}
+	if v, ok := res["result.statuscode"]; !f.IgnoreStatus && ok {
+		if n, err := strconv.Atoi(v); err == nil && n != 0 {
+			return n, nil
+		}
+	}
+	return 0, nil
+}
+
+type callFunc func([]byte, io.Writer) error
+
+func printValue(w io.Writer, printer callFunc, version string, format string, res map[string]string) error {
+	if format == "json" {
+		fmt.Fprintln(w, res["result.json"])
+		return nil
+	}
+
+	if res["version"] != "" && versions.LessThan(version, res["version"]) && res["result.txt"] != "" {
+		// structure is too new and we don't know how to print it
+		fmt.Fprint(w, res["result.txt"])
+		return nil
+	}
+	return printer([]byte(res["result.json"]), w)
+}
+
+func callAlias(target *string, value string) cobrautil.BoolFuncValue {
+	return func(s string) error {
+		v, err := strconv.ParseBool(s)
+		if err != nil {
+			return err
+		}
+
+		if v {
+			*target = value
+		}
+		return nil
+	}
+}
+
+// timeBuildCommand will start a timer for timing the build command. It records the time when the returned
+// function is invoked into a metric.
+func timeBuildCommand(mp metric.MeterProvider, attrs attribute.Set) func(err error) {
+	meter := metricutil.Meter(mp)
+	counter, _ := meter.Float64Counter("command.time",
+		metric.WithDescription("Measures the duration of the build command."),
+		metric.WithUnit("ms"),
+	)
+
+	start := time.Now()
+	return func(err error) {
+		dur := float64(time.Since(start)) / float64(time.Millisecond)
+		extraAttrs := attribute.NewSet()
+		if err != nil {
+			extraAttrs = attribute.NewSet(
+				attribute.String("error.type", otelErrorType(err)),
+			)
+		}
+		counter.Add(context.Background(), dur,
+			metric.WithAttributeSet(attrs),
+			metric.WithAttributeSet(extraAttrs),
+		)
+	}
+}
+
+// otelErrorType returns an attribute for the error type based on the error category.
+// If nil, this function returns an invalid attribute.
+func otelErrorType(err error) string {
+	name := "generic"
+	if errors.Is(err, context.Canceled) {
+		name = "canceled"
+	}
+	return name
+}
+
+const defaultTargetName = "default"
+
+type BuildOptions struct {
+	ContextPath            string
+	DockerfileName         string
+	CallFunc               *buildflags.CallFunc
+	NamedContexts          map[string]string
+	Allow                  []string
+	Attests                buildflags.Attests
+	BuildArgs              map[string]string
+	CacheFrom              []*buildflags.CacheOptionsEntry
+	CacheTo                []*buildflags.CacheOptionsEntry
+	CgroupParent           string
+	Exports                []*buildflags.ExportEntry
+	ExtraHosts             []string
+	Labels                 map[string]string
+	NetworkMode            string
+	NoCacheFilter          []string
+	Platforms              []string
+	Secrets                buildflags.Secrets
+	ShmSize                int64
+	SSH                    []*buildflags.SSH
+	Tags                   []string
+	Target                 string
+	Ulimits                *dockeropts.UlimitOpt
+	Resources              []string
+	Builder                string
+	NoCache                bool
+	Pull                   bool
+	ExportPush             bool
+	ExportLoad             bool
+	SourcePolicy           *sourcepolicy.Policy
+	Ref                    string
+	GroupRef               string
+	Annotations            []string
+	ProvenanceResponseMode string
+	Policy                 []buildflags.PolicyConfig
+}
+
+// RunBuild runs the specified build and returns the result.
+func RunBuild(ctx context.Context, dockerCli command.Cli, in *BuildOptions, inStream io.Reader, progress progress.Writer, bh *build.Handler) (*client.SolveResponse, *build.Inputs, error) {
+	if in.NoCache && len(in.NoCacheFilter) > 0 {
+		return nil, nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
+	}
+
+	contexts := map[string]build.NamedContext{}
+	for name, path := range in.NamedContexts {
+		contexts[name] = build.NamedContext{Path: path}
+	}
+
+	resourceLimits, err := build.ParseResourceLimits(in.Resources)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	opts := build.Options{
+		Inputs: build.Inputs{
+			ContextPath:    in.ContextPath,
+			DockerfilePath: in.DockerfileName,
+			InStream:       build.NewSyncMultiReader(inStream),
+			NamedContexts:  contexts,
+		},
+		Ref:                    in.Ref,
+		BuildArgs:              in.BuildArgs,
+		CgroupParent:           in.CgroupParent,
+		ExtraHosts:             in.ExtraHosts,
+		Labels:                 in.Labels,
+		NetworkMode:            in.NetworkMode,
+		NoCache:                in.NoCache,
+		NoCacheFilter:          in.NoCacheFilter,
+		Pull:                   in.Pull,
+		ShmSize:                dockeropts.MemBytes(in.ShmSize),
+		Tags:                   in.Tags,
+		Target:                 in.Target,
+		Ulimits:                in.Ulimits,
+		ResourceLimits:         resourceLimits,
+		GroupRef:               in.GroupRef,
+		ProvenanceResponseMode: confutil.ParseMetadataProvenance(in.ProvenanceResponseMode),
+	}
+
+	platforms, err := platformutil.Parse(in.Platforms)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts.Platforms = platforms
+
+	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{
+		AuthConfigProvider: dockerconfig.LoadAuthConfig(dockerCli),
+	}))
+
+	secrets, err := build.CreateSecrets(in.Secrets)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts.Session = append(opts.Session, secrets)
+
+	sshSpecs := in.SSH
+	if len(sshSpecs) == 0 && buildflags.IsGitSSH(in.ContextPath) {
+		sshSpecs = append(sshSpecs, &buildflags.SSH{ID: "default"})
+	}
+	ssh, err := build.CreateSSH(sshSpecs)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts.Session = append(opts.Session, ssh)
+
+	outputs, _, err := build.CreateExports(in.Exports)
+	if err != nil {
+		return nil, nil, err
+	}
+	if in.ExportPush {
+		var pushUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterImage {
+				outputs[i].Attrs["push"] = "true"
+				// Skip unpacking when only pushing to registry (unless explicitly set)
+				if _, ok := outputs[i].Attrs["unpack"]; !ok {
+					outputs[i].Attrs["unpack"] = "false"
+				}
+				pushUsed = true
+			}
+		}
+		if !pushUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type: client.ExporterImage,
+				Attrs: map[string]string{
+					"push": "true",
+					// Skip unpacking when only pushing to registry
+					"unpack": "false",
+				},
+			})
+		}
+	}
+	if in.ExportLoad {
+		var loadUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterDocker {
+				if _, ok := outputs[i].Attrs["dest"]; !ok {
+					loadUsed = true
+					break
+				}
+			}
+		}
+		if !loadUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type:  client.ExporterDocker,
+				Attrs: map[string]string{},
+			})
+		}
+	}
+
+	allow, allowLocalOutputDelete, err := buildflags.ParseEntitlements(in.Allow)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := build.ValidateLocalExportDelete(outputs, allowLocalOutputDelete); err != nil {
+		return nil, nil, err
+	}
+
+	opts.Annotations, err = buildflags.ParseAnnotations(in.Annotations)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "parse annotations")
+	}
+
+	for _, o := range outputs {
+		for k, v := range opts.Annotations {
+			o.Attrs[k.String()] = v
+		}
+	}
+
+	opts.Exports = outputs
+
+	opts.CacheFrom = build.CreateCaches(in.CacheFrom)
+	opts.CacheTo = build.CreateCaches(in.CacheTo)
+
+	opts.Attests = in.Attests.ToMap()
+
+	opts.SourcePolicy = in.SourcePolicy
+	opts.Policy = in.Policy
+
+	opts.Allow = allow
+
+	if in.CallFunc != nil {
+		opts.CallFunc = &build.CallFunc{
+			Name:         in.CallFunc.Name,
+			Format:       in.CallFunc.Format,
+			IgnoreStatus: in.CallFunc.IgnoreStatus,
+		}
+	}
+
+	// key string used for kubernetes "sticky" mode
+	contextPathHash, err := filepath.Abs(in.ContextPath)
+	if err != nil {
+		contextPathHash = in.ContextPath
+	}
+
+	b, err := builder.New(dockerCli,
+		builder.WithName(in.Builder),
+		builder.WithContextPathHash(contextPathHash),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = updateLastActivity(dockerCli, b.NodeGroup); err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to update builder last activity time")
+	}
+	imageVerifier := policy.DefaultImageVerifier(confutil.NewConfig(dockerCli))
+	nodes, err := b.LoadNodes(ctx, builder.WithImageVerifier(imageVerifier))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var inputs *build.Inputs
+	buildOptions := map[string]build.Options{defaultTargetName: opts}
+	resp, err := build.Build(ctx, nodes, buildOptions, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress, bh)
+	err = wrapBuildError(err, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if i, ok := buildOptions[defaultTargetName]; ok {
+		inputs = &i.Inputs
+	}
+	return resp[defaultTargetName], inputs, nil
+}
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (nopCloser) Close() error {
+	return nil
 }

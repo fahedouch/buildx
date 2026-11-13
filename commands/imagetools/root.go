@@ -1,19 +1,27 @@
 package commands
 
 import (
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
 )
 
-func RootCmd(dockerCli command.Cli) *cobra.Command {
+type RootOptions struct {
+	Builder *string
+}
+
+func RootCmd(rootcmd *cobra.Command, dockerCli command.Cli, opts RootOptions) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "imagetools",
-		Short: "Commands to work on images in registry",
+		Use:                   "imagetools",
+		Short:                 "Commands to work on images in registry",
+		ValidArgsFunction:     completion.Disable,
+		RunE:                  rootcmd.RunE,
+		DisableFlagsInUseLine: true,
 	}
 
 	cmd.AddCommand(
-		inspectCmd(dockerCli),
-		createCmd(dockerCli),
+		createCmd(dockerCli, opts),
+		inspectCmd(dockerCli, opts),
 	)
 
 	return cmd

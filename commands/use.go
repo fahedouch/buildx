@@ -3,6 +3,9 @@ package commands
 import (
 	"os"
 
+	"github.com/docker/buildx/store/storeutil"
+	"github.com/docker/buildx/util/cobrautil/completion"
+	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/pkg/errors"
@@ -16,7 +19,7 @@ type useOptions struct {
 }
 
 func runUse(dockerCli command.Cli, in useOptions) error {
-	txn, release, err := getStore(dockerCli)
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return err
 	}
@@ -28,14 +31,11 @@ func runUse(dockerCli command.Cli, in useOptions) error {
 				return errors.Errorf("run `docker context use default` to switch to default context")
 			}
 			if in.builder == "default" || in.builder == dockerCli.CurrentContext() {
-				ep, err := getCurrentEndpoint(dockerCli)
+				ep, err := dockerutil.GetCurrentEndpoint(dockerCli)
 				if err != nil {
 					return err
 				}
-				if err := txn.SetCurrent(ep, "", false, false); err != nil {
-					return err
-				}
-				return nil
+				return txn.SetCurrent(ep, "", false, false)
 			}
 			list, err := dockerCli.ContextStore().List()
 			if err != nil {
@@ -46,20 +46,15 @@ func runUse(dockerCli command.Cli, in useOptions) error {
 					return errors.Errorf("run `docker context use %s` to switch to context %s", in.builder, in.builder)
 				}
 			}
-
 		}
 		return errors.Wrapf(err, "failed to find instance %q", in.builder)
 	}
 
-	ep, err := getCurrentEndpoint(dockerCli)
+	ep, err := dockerutil.GetCurrentEndpoint(dockerCli)
 	if err != nil {
 		return err
 	}
-	if err := txn.SetCurrent(ep, in.builder, in.isGlobal, in.isDefault); err != nil {
-		return err
-	}
-
-	return nil
+	return txn.SetCurrent(ep, in.builder, in.isGlobal, in.isDefault)
 }
 
 func useCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
@@ -76,14 +71,13 @@ func useCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			}
 			return runUse(dockerCli, options)
 		},
+		ValidArgsFunction:     completion.BuilderNames(dockerCli),
+		DisableFlagsInUseLine: true,
 	}
 
 	flags := cmd.Flags()
-
 	flags.BoolVar(&options.isGlobal, "global", false, "Builder persists context changes")
 	flags.BoolVar(&options.isDefault, "default", false, "Set builder as default for current context")
-
-	_ = flags
 
 	return cmd
 }

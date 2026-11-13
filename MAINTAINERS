@@ -152,6 +152,8 @@ made through a pull request.
 		people = [
 			"akihirosuda",
 			"crazy-max",
+			"jedevc",
+			"jsternberg",
 			"tiborvass",
 			"tonistiigi",
 		]
@@ -187,6 +189,16 @@ made through a pull request.
 	Name = "Kevin Alvarez"
 	Email = "contact@crazymax.dev"
 	GitHub = "crazy-max"
+
+	[people.jedevc]
+	Name = "Justin Chadwell"
+	Email = "me@jedevc.com"
+	GitHub = "jedevc"
+
+	[people.jsternberg]
+	Name = "Jonathan Sternberg"
+	Email = "jonathan.sternberg@docker.com"
+	GitHub = "jsternberg"
 
 	[people.thajeztah]
 	Name = "Sebastiaan van Stijn"

@@ -46,7 +46,6 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Pod{},
 		&PodList{},
-		&PodStatusResult{},
 		&PodTemplate{},
 		&PodTemplateList{},
 		&ReplicationController{},
@@ -88,7 +87,6 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&RangeAllocation{},
 		&ConfigMap{},
 		&ConfigMapList{},
-		&EphemeralContainers{},
 	)
 
 	// Add common types
